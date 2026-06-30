@@ -9,11 +9,11 @@ $ErrorActionPreference = "Stop"
 # ----- paths -----
 
 $RepoRoot   = $PSScriptRoot | Split-Path
-$InstallDir = Join-Path $env:LOCALAPPDATA "wezterm-tmux-shim" "bin"
+$InstallDir = Join-Path (Join-Path $env:LOCALAPPDATA "wezterm-tmux-shim") "bin"
 $StateDat   = Join-Path $env:LOCALAPPDATA "wezterm-tmux-shim"
-$ExeSrc     = Join-Path $RepoRoot "target" "release" "tmux.exe"
+$ExeSrc     = Join-Path (Join-Path $RepoRoot "target") (Join-Path "release" "tmux.exe")
 $ExeDst     = Join-Path $InstallDir "tmux.exe"
-$CCSettings = Join-Path $env:LOCALAPPDATA "claude-code" "settings.json"
+$CCSettings = Join-Path (Join-Path $env:LOCALAPPDATA "claude-code") "settings.json"
 
 Write-Host "wezterm-tmux-shim installer" -ForegroundColor Cyan
 Write-Host "Repo root : $RepoRoot"
@@ -46,12 +46,12 @@ Write-Host "-------------------------------------------------------------"
 Write-Host ""
 Write-Host "1. Prepend the install dir to PATH in your CC launch context."
 Write-Host "   For the current PowerShell session only:"
-Write-Host "   $" + "env:PATH = $" + "(" + "$InstallDir" + ")" + " + [IO.Path]::PathSeparator + $" + "env:PATH"
+Write-Host "   `$env:PATH = `"$InstallDir`" + [IO.Path]::PathSeparator + `$env:PATH"
 Write-Host ""
 Write-Host "2. Set TMUX and TMUX_PANE so CC TmuxBackend sees a live session."
 Write-Host "   Run: wezterm cli list  to find your pane id (integer), then:"
-Write-Host "   $" + "env:TMUX     = " + ' + "wezterm-tmux-shim,0,0" + '
-Write-Host "   $" + "env:TMUX_PANE = " + ' + "%0" + '
+Write-Host "   `$env:TMUX     = `"wezterm-tmux-shim,0,0`""
+Write-Host "   `$env:TMUX_PANE = `"%0`""
 Write-Host ""
 Write-Host "3. Set CC teammate mode to tmux in CC settings.json:"
 Write-Host "   File: $CCSettings"

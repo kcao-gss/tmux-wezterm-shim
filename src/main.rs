@@ -4,6 +4,7 @@
 //! calls. Verified against claude 2.1.196. Unknown subcommands are logged and
 //! silently succeed so CC does not crash on version drift.
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -58,7 +59,7 @@ impl State {
 
 fn state_dir() -> PathBuf {
     let local_app = std::env::var("LOCALAPPDATA")
-        .unwrap_or_else(|_| r"C:UsersDefaultAppDataLocal".to_string());
+        .unwrap_or_else(|_| r"C:\Users\Default\AppData\Local".to_string());
     PathBuf::from(local_app).join("wezterm-tmux-shim")
 }
 
@@ -70,24 +71,43 @@ fn log_path() -> PathBuf {
     state_dir().join("shim.log")
 }
 
-fn load_state() -> State {
-    let p = state_path();
-    if !p.exists() {
-        return State::default();
-    }
-    let raw = match fs::read_to_string(&p) {
-        Ok(s) => s,
-        Err(_) => return State::default(),
-    };
-    serde_json::from_str(&raw).unwrap_or_default()
-}
-
-fn save_state(state: &State) {
+/// Load state while holding an exclusive OS file lock. Returns the lock file
+/// handle so the caller keeps the lock across the load-mutate-save cycle.
+fn load_state_locked() -> (State, fs::File) {
     let dir = state_dir();
     let _ = fs::create_dir_all(&dir);
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(dir.join("state.lock"))
+        .expect("failed to open state lock file");
+    lock_file
+        .lock_exclusive()
+        .expect("failed to acquire exclusive lock on state.lock");
+
     let p = state_path();
+    let state = if p.exists() {
+        match fs::read_to_string(&p) {
+            Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+            Err(_) => State::default(),
+        }
+    } else {
+        State::default()
+    };
+    (state, lock_file)
+}
+
+/// Write state atomically: serialize to a temp file, then rename onto state.json.
+/// The caller must hold the lock file returned by load_state_locked.
+fn save_state_locked(state: &State) {
+    let dir = state_dir();
+    let _ = fs::create_dir_all(&dir);
     let json = serde_json::to_string_pretty(state).unwrap_or_default();
-    let _ = fs::write(&p, json);
+    let tmp = dir.join("state.json.tmp");
+    if fs::write(&tmp, json.as_bytes()).is_ok() {
+        let _ = fs::rename(&tmp, state_path());
+    }
 }
 
 // ----- logging -----
@@ -119,7 +139,9 @@ fn wezterm_bin() -> String {
     if ok {
         return candidate.to_string();
     }
-    r"C:Program FilesWezTermwezterm.exe".to_string()
+    let prog_files = std::env::var("ProgramFiles")
+        .unwrap_or_else(|_| r"C:\Program Files".to_string());
+    format!(r"{}\WezTerm\wezterm.exe", prog_files)
 }
 
 fn run_wezterm(args: &[&str]) -> (String, String, i32) {
@@ -248,7 +270,7 @@ fn cmd_new_session(args: &[String], state: &mut State) -> i32 {
             .unwrap_or_else(|| "@0".into());
         let resolved = apply_format(&fmt, Some(&tmux_id), Some(&window_id));
         println!("{}", resolved);
-        save_state(state);
+        save_state_locked(state);
     }
     0
 }
@@ -282,7 +304,7 @@ fn cmd_new_window(args: &[String], state: &mut State) -> i32 {
             .unwrap_or_else(|| "@0".into());
         let resolved = apply_format(&fmt, Some(&tmux_id), Some(&window_id));
         println!("{}", resolved);
-        save_state(state);
+        save_state_locked(state);
     }
     0
 }
@@ -352,7 +374,7 @@ fn cmd_split_window(args: &[String], state: &mut State) -> i32 {
         let resolved = apply_format(&fmt, Some(&tmux_id), Some(&window_id));
         println!("{}", resolved);
     }
-    save_state(state);
+    save_state_locked(state);
     0
 }
 
@@ -379,7 +401,7 @@ fn cmd_list_panes(args: &[String], state: &mut State) -> i32 {
         let line = apply_format(&fmt, Some(&tmux_id), Some(&window_id));
         println!("{}", line);
     }
-    save_state(state);
+    save_state_locked(state);
     0
 }
 fn cmd_display_message(args: &[String], state: &mut State) -> i32 {
@@ -418,7 +440,7 @@ fn cmd_display_message(args: &[String], state: &mut State) -> i32 {
             .unwrap_or_else(|| "@0".into());
         let resolved = apply_format(&fmt, Some(&cur_pane), Some(&window_id));
         println!("{}", resolved);
-        save_state(state);
+        save_state_locked(state);
     }
     0
 }
@@ -521,7 +543,8 @@ fn cmd_respawn_pane(args: &[String], state: &mut State) -> i32 {
     let mut script_lines: Vec<String> = vec!["@echo off".to_string()];
     for (k, v) in &state.env_vars {
         // Escape % in values by doubling them (CMD batch syntax).
-        let escaped_v = v.replace('%', "%%");
+        // Also strip CR/LF to prevent batch command injection.
+        let escaped_v = v.replace('%', "%%").replace('\r', "").replace('\n', "");
         script_lines.push(format!("SET {}={}", k, escaped_v));
     }
     if cmd_parts.len() == 1 {
@@ -558,7 +581,7 @@ fn cmd_set_environment(args: &[String], state: &mut State) -> i32 {
         let value = filtered[1].to_string();
         log_line(&format!("  set-environment: {}={}", name, value));
         state.env_vars.insert(name, value);
-        save_state(state);
+        save_state_locked(state);
     }
     0
 }
@@ -624,7 +647,7 @@ fn main() {
     let subcommand = argv[1].clone();
     let args = argv[2..].to_vec();
 
-    let mut state = load_state();
+    let (mut state, _lock) = load_state_locked();
     let exit_code = dispatch(&subcommand, &args, &mut state);
 
     log_line(&format!("  -> exit {}", exit_code));

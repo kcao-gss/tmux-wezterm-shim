@@ -151,3 +151,14 @@ Generic `CLAUDE_CODE_*` names are stored - any `set-environment -g NAME VALUE` c
 - Format token coverage is limited to the observed CC API surface.
 - Not code-signed (may be blocked by corporate EDR on some machines).
 - Verified against claude 2.1.196 only.
+
+## Fix Round 1
+
+- B1 (LOCALAPPDATA fallback): src/main.rs - missing backslashes in the raw-string fallback path corrected to `C:\Users\Default\AppData\Local`.
+- B1 (wezterm.exe fallback): src/main.rs `wezterm_bin()` - replaced the broken raw-string literal with `%ProgramFiles%\WezTerm\wezterm.exe`, resolved via `std::env::var("ProgramFiles")`.
+- B2 (install.ps1 3-arg Join-Path): scripts/install.ps1 - nested all 3-arg `Join-Path` calls (lines 12, 14, 16) into 2-arg `Join-Path (Join-Path ...) ...` form for PowerShell 5.1 compatibility; verify run confirmed all three call sites threw the same error, not just the one originally flagged.
+- W1 (unlocked/non-atomic state file): Cargo.toml + src/main.rs - added `fs2` dependency; replaced `load_state`/`save_state` with `load_state_locked`/`save_state_locked`, which take an exclusive OS file lock on `state.lock` and write `state.json` atomically via temp-file + rename. All 6 call sites and `main()` updated.
+- W2 (garbled install.ps1 instructions): scripts/install.ps1 - rewrote the PATH/TMUX/TMUX_PANE `Write-Host` lines using backtick-escaped `$` so they print literal, copy-pastable PowerShell snippets instead of string-concatenation artifacts.
+- W3 (respawn-pane env value escaping): src/main.rs `cmd_respawn_pane` - env values now also strip CR/LF in addition to doubling `%`, preventing batch command injection via a stored env var containing a newline.
+
+Fix round 1 applied. Code compiles. Self-test deferred pending WezTerm restart.
