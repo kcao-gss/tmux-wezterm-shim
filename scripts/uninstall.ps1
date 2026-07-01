@@ -6,7 +6,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $InstallDir    = Join-Path $env:LOCALAPPDATA "wezterm-tmux-shim"
-$CCSettings    = Join-Path $env:LOCALAPPDATA "claude-code" "settings.json"
+$CCSettings    = Join-Path (Join-Path $env:LOCALAPPDATA "claude-code") "settings.json"
 $CCSettingsBak = "${CCSettings}.bak"
 
 Write-Host "wezterm-tmux-shim uninstaller" -ForegroundColor Cyan
