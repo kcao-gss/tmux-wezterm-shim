@@ -18,6 +18,7 @@ See `docs/INTEGRATION_TESTING.md` for the mechanics of how CC picks this backend
 
 - Windows 10/11.
 - [WezTerm](https://wezterm.org/) installed, with `wezterm.exe` either on PATH or in its default `%ProgramFiles%\WezTerm\` location.
+- [Git for Windows](https://git-scm.com/download/win) installed, so `bash.exe` is available for teammate command execution (see respawn-pane in Supported Subcommands).
 - Rust (MSVC toolchain) and VS Build Tools 2022, if building from source.
 - Claude Code, verified against `claude 2.1.196` (see Limitations below for version-drift risk).
 
@@ -115,7 +116,7 @@ The version string is embedded in the binary and printed by `tmux.exe -V`.
 | `select-pane -t <t> [-T title]` | Best-effort `wezterm cli set-tab-title`; otherwise no-op. |
 | `set-option ...` | No-op (exit 0). |
 | `resize-pane ...` | No-op (exit 0). |
-| `respawn-pane -k -t <target> -- <cmd>` | Writes a `.cmd` launcher with env vars; sends to pane via send-text. |
+| `respawn-pane -k -t <target> -- <cmd>` | Writes a bash `.sh` launcher plus a `.cmd` wrapper that invokes it via Git bash; sends the `.cmd` path to the pane via send-text. |
 | `set-environment -g <NAME> <VALUE>` | Stores in state file. |
 | `show-environment -g <NAME>` | Reads from state file. |
 | `break-pane ...` | No-op (exit 0). |
@@ -164,10 +165,17 @@ Check `shim.log` to detect drift.
 They map the first live WezTerm pane rather than creating a real tab or session.
 CC may expect session isolation between agent teams; this does not provide it.
 
-**`respawn-pane` needs an idle shell.**
+**Same-window targeting relies on `WEZTERM_PANE`.**
+`display-message`, `list-panes -t @N`, and the session/window-name fallback in `split-window`/`respawn-pane` all resolve "the current pane" from the `WEZTERM_PANE` environment variable, and teammates are split within that pane's window.
+If `WEZTERM_PANE` is missing or does not match a live pane, targeting falls back to the first pane found across all windows, which may not be the dispatching session's window.
+
+**`respawn-pane` needs an idle shell and Git bash.**
 WezTerm has no API to kill and restart a pane's process.
-The shim writes a `.cmd` launcher with stored env vars and sends it to the target pane via `wezterm cli send-text --no-paste`.
-This only works if the target pane is sitting at an idle shell prompt; if it is running another process, the keystrokes go to that process instead.
+The shim writes a bash `.sh` launcher (the CC-supplied command is a POSIX/bash string, e.g. `cd '...' && env VAR=val '...claude.exe' ...`) plus a thin `.cmd` wrapper that invokes it via a discovered Git-for-Windows `bash.exe`, then sends the `.cmd` path to the target pane via `wezterm cli send-text --no-paste`.
+This only works if the target pane is sitting at an idle shell prompt (if it is running another process, the keystrokes go to that process instead) and if Git for Windows is installed so `bash.exe` can be found.
+
+**Teammate panes auto-close based on `remain-on-exit`.**
+CC sets tmux's `remain-on-exit` option (via `set-option -p -t <pane> remain-on-exit <value>`) before each `respawn-pane`, and the shim now honors it: the generated launcher captures the teammate's exit code and runs `wezterm cli kill-pane` afterward according to the stored policy for that pane - `off` (the default when unset) closes the pane unconditionally, `failed` (what CC currently sets) closes it only on a clean exit and leaves it open on failure so the error is visible, and `on` never closes it automatically.
 
 **Format token coverage is limited** to the tokens CC was observed to use.
 Unknown `#{...}` tokens are left as-is in the output.

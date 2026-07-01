@@ -31,6 +31,12 @@ struct State {
     next_pane: u64,
     /// stored environment variables (set-environment / show-environment)
     env_vars: HashMap<String, String>,
+    /// WezTerm integer pane id -> tmux "remain-on-exit" value ("off"/"on"/
+    /// "failed"), set via `set-option -p -t <pane> remain-on-exit <value>`.
+    /// Absent entries default to "off" (tmux's own default), matching the
+    /// close-always behavior respawn-pane used before this field existed.
+    #[serde(default)]
+    remain_on_exit: HashMap<u64, String>,
 }
 
 impl State {
@@ -52,6 +58,26 @@ impl State {
 
     fn wez_id_for_tmux(&self, tmux_id: &str) -> Option<u64> {
         self.tmux_to_wez.get(tmux_id).copied()
+    }
+
+    /// Force tmux_id to map to wez_id, overriding any stale mapping on either
+    /// side. Used to anchor WEZTERM_PANE as the authoritative "current pane":
+    /// if tmux_id was previously bound to a different wezterm pane, or wez_id
+    /// was previously known under a different tmux id, both stale entries are
+    /// removed before the new pair is inserted.
+    fn bind_pane(&mut self, tmux_id: &str, wez_id: u64) {
+        if let Some(old_wez) = self.tmux_to_wez.get(tmux_id).copied() {
+            if old_wez != wez_id {
+                self.wez_to_tmux.remove(&old_wez);
+            }
+        }
+        if let Some(old_tid) = self.wez_to_tmux.get(&wez_id).cloned() {
+            if old_tid != tmux_id {
+                self.tmux_to_wez.remove(&old_tid);
+            }
+        }
+        self.tmux_to_wez.insert(tmux_id.to_string(), wez_id);
+        self.wez_to_tmux.insert(wez_id, tmux_id.to_string());
     }
 }
 
@@ -181,6 +207,43 @@ fn run_wezterm(args: &[&str]) -> (String, String, i32) {
     }
 }
 
+// ----- bash binary resolution (for respawn-pane launcher execution) -----
+
+/// Locate a Git-for-Windows bash.exe to execute the POSIX command strings CC
+/// builds for respawn-pane. CC assumes a Unix /bin/sh is available; on Windows
+/// the closest equivalent is Git bash. Preference order:
+///   1. $SHELL, if it names an existing file (CC or the user may set this).
+///   2. The default Git-for-Windows install location (64-bit layout).
+///   3. The default Git-for-Windows install location (usr/bin layout).
+///   4. Bare "bash" resolved via PATH, as a last resort.
+/// Returns None if nothing is found; callers must fail soft.
+fn bash_bin() -> Option<String> {
+    if let Ok(shell) = std::env::var("SHELL") {
+        if !shell.is_empty() && PathBuf::from(&shell).is_file() {
+            return Some(shell);
+        }
+    }
+    let candidates = [
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+    ];
+    for c in candidates {
+        if PathBuf::from(c).is_file() {
+            return Some(c.to_string());
+        }
+    }
+    let ok = Command::new("bash")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok();
+    if ok {
+        return Some("bash".to_string());
+    }
+    None
+}
+
 // ----- WezTerm JSON pane list -----
 
 #[derive(Debug, Deserialize)]
@@ -214,17 +277,30 @@ fn apply_format(fmt: &str, pane_id: Option<&str>, window_id: Option<&str>) -> St
     out
 }
 
-/// Resolve the "current" pane tmux id from environment. Prefers TMUX_PANE,
-/// then maps WEZTERM_PANE (integer) through state. Allocates a new id if unseen.
+/// Resolve the "current" pane tmux id from environment. WEZTERM_PANE is
+/// authoritative when present; TMUX_PANE is rebound to it if the two disagree.
+/// Allocates a new id if unseen.
 fn resolve_current_pane(state: &mut State) -> String {
+    // WEZTERM_PANE is authoritative: it is the actual pane wezterm launched
+    // this process in, so it always names the real "current" pane. CC also
+    // reconstructs TMUX_PANE from a previous display-message reply, which can
+    // go stale (e.g. still pointing at an old session's pane after a restart).
+    // When both are present, force the tmux id CC already knows as TMUX_PANE
+    // to point at the real WEZTERM_PANE rather than trusting a stale binding.
+    if let Ok(wp) = std::env::var("WEZTERM_PANE") {
+        if let Ok(wid) = wp.parse::<u64>() {
+            if let Ok(tp) = std::env::var("TMUX_PANE") {
+                if !tp.is_empty() {
+                    state.bind_pane(&tp, wid);
+                    return tp;
+                }
+            }
+            return state.tmux_id_for_wez(wid);
+        }
+    }
     if let Ok(tp) = std::env::var("TMUX_PANE") {
         if !tp.is_empty() {
             return tp;
-        }
-    }
-    if let Ok(wp) = std::env::var("WEZTERM_PANE") {
-        if let Ok(wid) = wp.parse::<u64>() {
-            return state.tmux_id_for_wez(wid);
         }
     }
     // Fallback: allocate %0 mapped to wezterm pane 0.
@@ -235,16 +311,28 @@ fn resolve_current_pane(state: &mut State) -> String {
 
 /// Resolve a tmux target string to a WezTerm pane id.
 /// Handles: tmux pane id ("%N"), bare integer (wezterm id), or session/window
-/// name (best-effort: return first live pane).
-fn resolve_target(target: &str, state: &State) -> Option<u64> {
+/// name (best-effort: prefer a pane in the current pane's own window).
+fn resolve_target(target: &str, state: &mut State) -> Option<u64> {
     if target.starts_with('%') {
         return state.wez_id_for_tmux(target);
     }
     if let Ok(n) = target.parse::<u64>() {
         return Some(n);
     }
-    // Session or window name - pick first live pane as best-effort.
+    // Session or window name - best-effort: prefer a pane in the dispatching
+    // session's own window over the first pane found across all windows.
+    // Without this, name/window-name targets always resolved into whichever
+    // window happened to list first (window 0), so a teammate spawned from a
+    // claude session in window 1 could split off a pane in window 0 instead.
     let panes = list_wez_panes();
+    let cur_tmux = resolve_current_pane(state);
+    if let Some(cur_wez) = state.wez_id_for_tmux(&cur_tmux) {
+        if let Some(cur_window) = panes.iter().find(|p| p.pane_id == cur_wez).map(|p| p.window_id) {
+            if let Some(p) = panes.iter().find(|p| p.window_id == cur_window) {
+                return Some(p.pane_id);
+            }
+        }
+    }
     panes.first().map(|p| p.pane_id)
 }
 // ----- subcommand handlers -----
@@ -393,10 +481,24 @@ fn cmd_split_window(args: &[String], state: &mut State) -> i32 {
 
 fn cmd_list_panes(args: &[String], state: &mut State) -> i32 {
     // list-panes [-t <target>] -F <fmt>
+    //
+    // -t can name a window ("@N", tmux window id - our apply_format already
+    // sets this equal to the wezterm window_id) or a pane ("%N"). When it
+    // names a window, only panes in that window must be listed - CC relies on
+    // this to enumerate panes to split/target within its own session, and an
+    // unfiltered list previously let a later split-window fall back to a pane
+    // in an unrelated window.
     let mut fmt = String::new();
+    let mut target = String::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "-t" => {
+                i += 1;
+                if i < args.len() {
+                    target = args[i].clone();
+                }
+            }
             "-F" => {
                 i += 1;
                 if i < args.len() {
@@ -408,10 +510,23 @@ fn cmd_list_panes(args: &[String], state: &mut State) -> i32 {
         i += 1;
     }
     let panes = list_wez_panes();
+    let window_filter: Option<u64> = target.strip_prefix('@').and_then(|n| n.parse::<u64>().ok());
+    let cur_tmux = resolve_current_pane(state);
+    let cur_wez = state.wez_id_for_tmux(&cur_tmux);
     for wp in &panes {
+        if let Some(wid) = window_filter {
+            if wp.window_id != wid {
+                continue;
+            }
+        }
         let tmux_id = state.tmux_id_for_wez(wp.pane_id);
         let window_id = format!("@{}", wp.window_id);
-        let line = apply_format(&fmt, Some(&tmux_id), Some(&window_id));
+        let mut line = apply_format(&fmt, Some(&tmux_id), Some(&window_id));
+        // Mark the pane bound to WEZTERM_PANE as active/current so CC treats
+        // it (not an arbitrary first pane) as its own when scanning this list.
+        let is_current = cur_wez == Some(wp.pane_id);
+        line = line.replace("#{pane_active}", if is_current { "1" } else { "0" });
+        line = line.replace("#{pane_current}", if is_current { "1" } else { "0" });
         println!("{}", line);
     }
     save_state_locked(state);
@@ -446,9 +561,15 @@ fn cmd_display_message(args: &[String], state: &mut State) -> i32 {
     }
     if print_mode && !fmt.is_empty() {
         let cur_pane = resolve_current_pane(state);
+        // Look up window_id for the *resolved current pane*, not the first
+        // pane in the whole list - the caller could be in any window, and
+        // reporting window 0 unconditionally was the root cause of teammates
+        // landing in the wrong window (see resolve_target/cmd_list_panes).
         let panes = list_wez_panes();
-        let window_id = panes
-            .first()
+        let cur_wez = state.wez_id_for_tmux(&cur_pane);
+        let window_id = cur_wez
+            .and_then(|wid| panes.iter().find(|p| p.pane_id == wid))
+            .or_else(|| panes.first())
             .map(|p| format!("@{}", p.window_id))
             .unwrap_or_else(|| "@0".into());
         let resolved = apply_format(&fmt, Some(&cur_pane), Some(&window_id));
@@ -492,8 +613,42 @@ fn cmd_select_pane(args: &[String], _state: &mut State) -> i32 {
     0
 }
 
-fn cmd_set_option(_args: &[String], _state: &mut State) -> i32 {
-    // Best-effort no-op.
+fn cmd_set_option(args: &[String], state: &mut State) -> i32 {
+    // set-option -p -t <target> <name> [value]
+    //
+    // Only "remain-on-exit" is tracked (see cmd_respawn_pane's auto-close
+    // teardown); every other option name stays a best-effort no-op, matching
+    // the pre-existing behavior for pane-border-style, window-style, etc.
+    let mut target = String::new();
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                i += 1;
+                if i < args.len() {
+                    target = args[i].clone();
+                }
+            }
+            "-p" | "-g" | "-a" | "-u" | "-o" | "-q" | "-s" | "-w" => {}
+            s if s.starts_with('-') => {}
+            _ => positional.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    if positional.first().map(|s| s.as_str()) == Some("remain-on-exit") {
+        let value = positional.get(1).cloned().unwrap_or_else(|| "on".to_string());
+        if let Some(wez_target) = resolve_target(&target, state) {
+            log_line(&format!(
+                "  set-option: remain-on-exit target={} wez_target={} value={}",
+                target, wez_target, value
+            ));
+            state.remain_on_exit.insert(wez_target, value);
+            save_state_locked(state);
+        } else {
+            log_line(&format!("  set-option: could not resolve target={}", target));
+        }
+    }
     0
 }
 
@@ -506,17 +661,32 @@ fn cmd_respawn_pane(args: &[String], state: &mut State) -> i32 {
     //
     // Approach: WezTerm has no direct respawn-pane API. We implement this by:
     //   1. Resolving <target> to a WezTerm pane id.
-    //   2. Writing a generated .cmd launcher script to the state dir that:
-    //        a. Exports any stored CLAUDE_CODE_* env vars via SET commands.
-    //        b. Invokes <cmd> (the tail of args after --).
-    //   3. Sending the launcher path + CR to the pane via:
-    //        wezterm cli send-text --pane-id <id> --no-paste "<launcher>"
+    //   2. Writing a generated bash launcher (.sh) that exports stored env vars
+    //      and then runs <cmd> (the tail of args after --) as-is. CC's native
+    //      agent-teams path builds <cmd> as a POSIX/bash command string (e.g.
+    //      `cd '...' && env VAR=val '...\claude.exe' ...`), so it must be
+    //      interpreted by a real POSIX shell rather than cmd.exe.
+    //   3. Appending an auto-close teardown after <cmd> that honors the
+    //      "remain-on-exit" option CC sets via set-option before each
+    //      respawn-pane (see cmd_set_option): the pane is destroyed with
+    //      `wezterm cli kill-pane` on exit code 0 when the policy is "off"
+    //      (unconditional close, tmux's own default and our default when the
+    //      pane was never given a policy) or "failed" (close only on a clean
+    //      exit; a failing teammate leaves its pane open by design so the
+    //      user can read the error), and never destroyed when "on".
+    //   4. Writing a thin .cmd wrapper that just invokes that .sh under a
+    //      discovered Git-for-Windows bash.exe.
+    //   5. Sending the .cmd path + CR to the pane via:
+    //        wezterm cli send-text --pane-id <id> --no-paste "<launcher>"
+    //      A .cmd is always run by cmd.exe regardless of the shell the target
+    //      pane happens to be sitting in, so this delivery step stays
+    //      shell-agnostic even though the payload it launches is now bash.
     //
     // Limitation: the target pane must have an idle shell accepting input.
     // WezTerm has no API to kill and restart a pane process. For CC agent-teams,
     // panes are typically idle shells between invocations, so this works in
-    // practice for the spike. If the pane is occupied, send-text deposits
-    // keystrokes into the running process instead.
+    // practice. If the pane is occupied, send-text deposits keystrokes into the
+    // running process instead.
     let mut target = String::new();
     let mut cmd_parts: Vec<String> = Vec::new();
     let mut after_dashdash = false;
@@ -549,31 +719,78 @@ fn cmd_respawn_pane(args: &[String], state: &mut State) -> i32 {
         log_line("  respawn-pane: no cmd after --; nothing to do");
         return 0;
     }
-    // Build .cmd launcher script with stored env vars then the command.
+    // The command is typically a single POSIX/bash command string; if CC ever
+    // passes it as multiple argv entries, join with spaces and let bash parse
+    // the result, matching the previous joining behavior.
+    let posix_cmd = cmd_parts.join(" ");
+
     let dir = state_dir();
     let _ = fs::create_dir_all(&dir);
-    let script_path = dir.join(format!("respawn_{}.cmd", wez_target));
-    let mut script_lines: Vec<String> = vec!["@echo off".to_string()];
+
+    // Write the bash launcher (.sh). LF line endings only - CRLF in a shebang
+    // script confuses bash's #! handling and can break here-doc-free scripts.
+    let sh_path = dir.join(format!("respawn_{}.sh", wez_target));
+    let mut sh_lines: Vec<String> = vec!["#!/usr/bin/env bash".to_string()];
     for (k, v) in &state.env_vars {
-        // Escape % in values by doubling them (CMD batch syntax).
-        // Also strip CR/LF to prevent batch command injection.
-        let escaped_v = v.replace('%', "%%").replace('\r', "").replace('\n', "");
-        script_lines.push(format!("SET {}={}", k, escaped_v));
+        // Strip CR/LF to prevent script injection via a stored env var, then
+        // single-quote the value using the standard bash escaping idiom:
+        // close the quote, emit an escaped literal quote, reopen the quote.
+        let clean_v = v.replace('\r', "").replace('\n', "");
+        let escaped_v = clean_v.replace('\'', r"'\''");
+        sh_lines.push(format!("export {}='{}'", k, escaped_v));
     }
-    if cmd_parts.len() == 1 {
-        script_lines.push(cmd_parts[0].clone());
-    } else {
-        let exe = &cmd_parts[0];
-        let rest = cmd_parts[1..].join(" ");
-        script_lines.push(format!("\"{}\" {}", exe, rest));
+    sh_lines.push(posix_cmd);
+
+    // Auto-close teardown: honor the "remain-on-exit" policy CC set for this
+    // pane via set-option (default "off" - close always - when unset, which
+    // matches tmux's own default).
+    let policy = state
+        .remain_on_exit
+        .get(&wez_target)
+        .map(|s| s.as_str())
+        .unwrap_or("off");
+    sh_lines.push("rc=$?".to_string());
+    let kill_cmd = format!("wezterm cli kill-pane --pane-id {}", wez_target);
+    match policy {
+        "on" => {
+            // Never auto-close; emit nothing.
+        }
+        "failed" => {
+            sh_lines.push(format!("if [ \"$rc\" -eq 0 ]; then {}; fi", kill_cmd));
+        }
+        _ => {
+            // "off" or any unrecognized value - close unconditionally.
+            sh_lines.push(kill_cmd);
+        }
     }
-    let script_content = script_lines.join("\r\n");
-    if let Err(e) = fs::write(&script_path, script_content.as_bytes()) {
-        log_line(&format!("  respawn-pane: failed to write launcher: {}", e));
+
+    let sh_content = sh_lines.join("\n") + "\n";
+    if let Err(e) = fs::write(&sh_path, sh_content.as_bytes()) {
+        log_line(&format!("  respawn-pane: failed to write bash launcher: {}", e));
         return 0;
     }
-    let script_str = script_path.to_string_lossy().to_string();
-    let send_text_arg = format!("{}\r", script_str);
+
+    // Write the .cmd wrapper that hands the .sh off to bash.
+    let bash = match bash_bin() {
+        Some(b) => {
+            log_line(&format!("  respawn-pane: using bash={}", b));
+            b
+        }
+        None => {
+            log_line("  respawn-pane: no bash.exe found (Git for Windows required); launcher will fail");
+            "bash".to_string()
+        }
+    };
+    let sh_str = sh_path.to_string_lossy().to_string();
+    let cmd_path = dir.join(format!("respawn_{}.cmd", wez_target));
+    let cmd_content = format!("@echo off\r\n\"{}\" \"{}\"\r\n", bash, sh_str);
+    if let Err(e) = fs::write(&cmd_path, cmd_content.as_bytes()) {
+        log_line(&format!("  respawn-pane: failed to write cmd wrapper: {}", e));
+        return 0;
+    }
+
+    let cmd_str = cmd_path.to_string_lossy().to_string();
+    let send_text_arg = format!("{}\r", cmd_str);
     let pane_id_str = wez_target.to_string();
     run_wezterm(&[
         "cli",
@@ -652,13 +869,24 @@ fn main() {
         std::process::exit(0);
     }
 
-    if argv.len() < 2 {
-        log_line("UNHANDLED: no subcommand (argc < 2)");
+    // Skip tmux's global options (e.g. `-S <socket>`, reconstructed by CC
+    // from the TMUX env var) to find the actual subcommand.
+    let mut i = 1;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "-S" | "-L" | "-f" | "-c" | "-T" => i += 2,
+            "-2" | "-C" | "-CC" | "-D" | "-l" | "-q" | "-u" | "-v" | "-V" => i += 1,
+            _ => break,
+        }
+    }
+
+    if i >= argv.len() {
+        log_line("UNHANDLED: no subcommand after global flags");
         std::process::exit(0);
     }
 
-    let subcommand = argv[1].clone();
-    let args = argv[2..].to_vec();
+    let subcommand = argv[i].clone();
+    let args = argv[i + 1..].to_vec();
 
     let (mut state, _lock) = load_state_locked();
     let exit_code = dispatch(&subcommand, &args, &mut state);

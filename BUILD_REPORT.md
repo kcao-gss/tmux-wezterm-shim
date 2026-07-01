@@ -206,3 +206,68 @@ Recommendation adopted throughout the docs: use the per-session `--teammate-mode
 
 `scripts/install.ps1` still prints a step recommending a global `settings.json` teammateMode change; this predates the Phase 1 findings above and was out of scope for this build (not listed in the Phase 1 task brief).
 It should be revisited to align with the per-session activation guidance now documented in the README.
+
+### Fix Round 2: teammates never start (empty panes)
+
+Live testing of the native agent-teams path (via `shim.log`) found two bugs that together left every spawned teammate pane idle.
+
+**Global-flag parsing.**
+CC's native teammate path invokes the shim as `tmux.exe -S wezterm-tmux-shim <subcommand> ...`, reconstructing the socket name from the `TMUX` env var on every call.
+`main()` previously read `argv[1]` directly as the subcommand, so it read `-S` instead and every call fell through to the `UNHANDLED` fail-soft path.
+Fix: `main()` now skips tmux's global options (`-S`, `-L`, `-f`, `-c`, `-T` consume the following argument; `-2`, `-C`, `-CC`, `-D`, `-l`, `-q`, `-u`, `-v` are booleans) before reading the subcommand.
+
+**`respawn-pane` wrote a batch file for a bash command.**
+The native flow is `split-window -d -t <pane> (-v|-h) -- cat` (discarding the `cat`, leaving an idle shell), then `respawn-pane -k -t <pane> -- "<CMD>"` where `<CMD>` is a POSIX/bash command string built by CC, for example `cd '...' && env VAR=val '...\claude.exe' --agent-id ...`.
+`cmd_respawn_pane` wrote this verbatim into a `.cmd` batch file and delivered it via `wezterm cli send-text`.
+cmd.exe cannot parse bash syntax (`env VAR=val`, single-quoted paths, `&&` inside single-quoted segments the way bash does), so the launcher silently failed and the pane stayed idle.
+Fix: `cmd_respawn_pane` now writes two files per respawn - `respawn_<id>.sh` (LF line endings, a shebang, `export NAME='value'` lines for each stored `env_vars` entry with bash single-quote escaping, then the raw `<CMD>` string unmodified) and `respawn_<id>.cmd` (a thin `@echo off` wrapper that invokes a discovered `bash.exe` on the `.sh` path).
+Delivery is unchanged: the `.cmd` path plus `\r` is still sent via `wezterm cli send-text --pane-id <id> --no-paste`, since a `.cmd` always runs under cmd.exe regardless of the shell state of the target pane.
+A new `bash_bin()` helper resolves the Git-for-Windows `bash.exe` to invoke, in order: `$SHELL` if it names an existing file, `C:\Program Files\Git\bin\bash.exe`, `C:\Program Files\Git\usr\bin\bash.exe`, then bare `bash` on PATH.
+If none are found, the shim logs the failure and still writes the launcher files (fail-soft) rather than panicking.
+
+Verified by generating a launcher against a scratch state directory and executing both the `.sh` directly under `bash.exe` and the `.cmd` wrapper directly under `cmd.exe`; both correctly exported stored env vars (including a value containing an embedded single quote) and ran the tail command.
+`cargo build --release` passes with no warnings after both fixes.
+
+### Fix Round 3: teammates spawn into the wrong WezTerm window
+
+Live testing with two WezTerm windows open (one running the dispatching `claude` session, one unrelated) found teammates landing in the unrelated window instead of the dispatching session's own window.
+`shim.log` traced the exact sequence: `display-message -t %0 -p '#{window_id}'` returned `@0` even though the dispatching claude process had `WEZTERM_PANE=7` in window 1, then `list-panes -t @0` returned panes from every window (not just window 0), then `split-window -t %2` resolved `%2` to a wezterm pane in window 0 and split there.
+`state.json` showed `%0` stale-bound to wezterm pane 1 (window 0) from an earlier session, rather than to pane 7 (window 1), the pane the current process was actually launched in.
+Three root causes combined to produce this:
+
+**`cmd_list_panes` ignored its `-t @N` window filter.**
+It always listed every live pane across every window.
+Fix: `cmd_list_panes` now parses `-t @N` and, when the target is a window id, only lists panes whose wezterm `window_id` matches `N`. Panes are also marked with `#{pane_active}`/`#{pane_current}` set to `1` for the pane bound to `WEZTERM_PANE`, `0` otherwise, so CC can pick out its own pane from the list.
+
+**The "current pane" was not anchored to `WEZTERM_PANE`.**
+`resolve_current_pane` previously trusted `TMUX_PANE` unconditionally, but `TMUX_PANE` is reconstructed by CC from an earlier `display-message` reply and can go stale across sessions, leaving it bound to the wrong wezterm pane (and thus the wrong window).
+Fix: `resolve_current_pane` now treats `WEZTERM_PANE` as authoritative. When both env vars are present, it force-rebinds `TMUX_PANE`'s tmux id to the real `WEZTERM_PANE` wezterm pane via a new `State::bind_pane` helper (which also evicts the old, now-incorrect mapping on both sides) before returning it. `cmd_display_message` was also fixed to report the `window_id` of this resolved current pane instead of unconditionally reporting the first pane in `wezterm cli list`'s output.
+
+**`resolve_target`'s session/window-name fallback always picked the first pane found.**
+`wezterm cli list --format json` lists windows in creation order, so "first pane" meant "first pane of window 0" regardless of which window the dispatching session was actually in.
+Fix: `resolve_target` now resolves the current pane's window via `resolve_current_pane` first, and returns a pane from that window when one exists; it falls back to the previous first-pane behavior only if the current pane cannot be resolved.
+
+Verified against a genuine two-window WezTerm instance (a scratch `LOCALAPPDATA` state directory, never the real one): with `WEZTERM_PANE` set to a pane in the second window, `list-panes -t @<other-window>` excluded the second window's pane, `list-panes -t @<own-window>` returned only the second window's pane, and `split-window -t <name>` (forcing the name-fallback path in `resolve_target`) created its new pane inside the second window alongside `WEZTERM_PANE`, not in window 0.
+`cargo build --release` passes with no warnings after this fix.
+
+### Fix Round 4: teammate panes never auto-closed
+
+`cmd_split_window` creates the pane running the default shell, and `cmd_respawn_pane` delivers the teammate launcher by `wezterm cli send-text` into that shell, so the teammate process runs as a child of the persistent shell.
+When the teammate exits, control returns to the still-alive shell and the pane stays open forever, regardless of how the teammate exited.
+Separately, CC issues `set-option -p -t <pane> remain-on-exit failed` immediately before each `respawn-pane` (confirmed in `shim.log`), but `cmd_set_option` was a hard no-op, so this teardown intent was silently dropped.
+
+**`cmd_set_option` now tracks `remain-on-exit`.**
+It parses `-t <target>` plus the trailing `<name> [value]` positional pair, resolves `<target>` through the existing `resolve_target`, and, only when `<name>` is `remain-on-exit`, stores `<value>` in a new `State.remain_on_exit: HashMap<u64, String>` field keyed by wezterm pane id.
+The field carries `#[serde(default)]` so existing `state.json` files without it still deserialize.
+Every other option name (`pane-border-style`, `window-style`, `pane-active-border-style`, `pane-border-format`, etc.) remains a no-op, unchanged from before.
+
+**`cmd_respawn_pane` now appends an auto-close teardown to the generated `.sh`.**
+After the teammate command line, it looks up `state.remain_on_exit.get(&wez_target)` (defaulting to `"off"`, tmux's own default, when the pane was never given a policy) and appends `rc=$?` followed by:
+- `"off"` (or any unset/unrecognized value): `wezterm cli kill-pane --pane-id <id>` unconditionally - pane always closes.
+- `"failed"` (what CC actually sets): `if [ "$rc" -eq 0 ]; then wezterm cli kill-pane --pane-id <id>; fi` - pane closes only on a clean exit; a failing teammate leaves its pane open so the user can read the error.
+- `"on"`: nothing is appended - pane never auto-closes.
+
+The env-export lines, the raw command line, and the `.cmd` wrapper + `send-text` delivery are all unchanged.
+
+Verified by exercising `cmd_set_option` with the exact argv CC sends (`set-option -p -t %N remain-on-exit failed`) followed by `cmd_respawn_pane`, and inspecting the generated `.sh` for all three `remain-on-exit` values in a scratch state directory (never the real one).
+`cargo build --release` passes with no warnings after this fix.
