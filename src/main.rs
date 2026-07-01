@@ -73,18 +73,31 @@ fn log_path() -> PathBuf {
 
 /// Load state while holding an exclusive OS file lock. Returns the lock file
 /// handle so the caller keeps the lock across the load-mutate-save cycle.
-fn load_state_locked() -> (State, fs::File) {
+/// Fail-soft: if the lock file cannot be opened or locked (e.g. a read-only
+/// %LOCALAPPDATA%), logs the failure and returns loaded-or-default state with
+/// no lock rather than panicking. The caller then proceeds without state
+/// persistence guarantees for that invocation.
+fn load_state_locked() -> (State, Option<fs::File>) {
     let dir = state_dir();
     let _ = fs::create_dir_all(&dir);
-    let lock_file = OpenOptions::new()
+    let lock_file = match OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .open(dir.join("state.lock"))
-        .expect("failed to open state lock file");
-    lock_file
-        .lock_exclusive()
-        .expect("failed to acquire exclusive lock on state.lock");
+    {
+        Ok(f) => match f.lock_exclusive() {
+            Ok(()) => Some(f),
+            Err(e) => {
+                log_line(&format!("  failed to acquire exclusive lock on state.lock: {}", e));
+                None
+            }
+        },
+        Err(e) => {
+            log_line(&format!("  failed to open state lock file: {}", e));
+            None
+        }
+    };
 
     let p = state_path();
     let state = if p.exists() {

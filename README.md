@@ -2,14 +2,90 @@
 
 A native Windows `tmux.exe` shim that translates the tmux subcommands Claude Code's agent-teams feature emits into `wezterm cli` calls.
 
+## What This Is
+
+Claude Code (CC) agent-teams mode dispatches teammates into terminal panes by shelling out to a real `tmux` binary.
+Windows has no native tmux, and the macOS-side alternative (iTerm2) does not exist on Windows either.
+This shim is a drop-in `tmux.exe` that sits in front of WezTerm - a native Windows terminal emulator with a scriptable CLI (`wezterm cli`) - and translates CC's tmux calls into WezTerm pane operations.
+
 ## Why This Exists
 
-Claude Code (CC) agent-teams mode is hard-coded to use tmux as its multiplexer backend.
-It spawns a bare `tmux` executable and issues subcommands to create panes, split windows, and pass environment variables between agents.
-Windows has no native tmux.
-iTerm2, the macOS-side alternative CC supports, also does not exist on Windows.
+CC's agent-teams backend selection is effectively hard-coded around tmux on non-macOS platforms.
+Rather than wait for native Windows support, this shim reverse-engineers the subset of the tmux CLI that CC actually calls (`new-session`, `split-window`, `list-panes`, `display-message`, `set-environment`, `respawn-pane`, and a handful more) and re-implements each one against `wezterm cli`.
+See `docs/INTEGRATION_TESTING.md` for the mechanics of how CC picks this backend.
 
-This shim sits in front of WezTerm - a native Windows terminal emulator with a rich CLI (`wezterm cli`) - and bridges CC's tmux API surface to WezTerm's actual capabilities.
+## Requirements
+
+- Windows 10/11.
+- [WezTerm](https://wezterm.org/) installed, with `wezterm.exe` either on PATH or in its default `%ProgramFiles%\WezTerm\` location.
+- Rust (MSVC toolchain) and VS Build Tools 2022, if building from source.
+- Claude Code, verified against `claude 2.1.196` (see Limitations below for version-drift risk).
+
+## Build
+
+Requires the MSVC toolchain and VS Build Tools 2022 for the linker.
+The GNU (MinGW) toolchain also compiles but its output has been seen quarantined by endpoint security on locked-down machines; prefer MSVC.
+
+```powershell
+# Install VS Build Tools 2022 with C++ workload
+winget install Microsoft.VisualStudio.2022.BuildTools ...
+
+# Set up MSVC environment (one-time per shell session)
+# Adjust the MSVC version path to match your install
+$VCTools = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207"
+$WinSDK  = "C:\Program Files (x86)\Windows Kits\10\lib\10.0.26100.0"
+$env:LIB = "$VCTools\lib\x64;$WinSDK\um\x64;$WinSDK\ucrt\x64"
+$env:PATH = "$VCTools\bin\Hostx64\x64;" + $env:PATH
+
+# Build
+cd C:\Users\you\Projects\wezterm-tmux-shim
+cargo build --release
+# Output: target\release\tmux.exe
+```
+
+## Install
+
+```powershell
+.\scripts\install.ps1
+```
+
+The script copies `tmux.exe` to `%LOCALAPPDATA%\wezterm-tmux-shim\bin\` and prints (does NOT apply) the PATH/TMUX steps below.
+It also backs up your CC `settings.json` to `settings.json.bak` in case you choose to experiment with the global setting mentioned in Activation.
+You should not need that backup if you follow the recommended per-session flag instead.
+
+## Activation
+
+Recommended: activate per session with the `--teammate-mode` CLI flag.
+Do not globally set `teammateMode` in CC's `settings.json`.
+
+Set up the current PowerShell session, then launch CC with the flag:
+
+```powershell
+$env:PATH      = "$env:LOCALAPPDATA\wezterm-tmux-shim\bin" + [IO.Path]::PathSeparator + $env:PATH
+$env:TMUX      = "wezterm-tmux-shim,0,0"
+$env:TMUX_PANE = "%0"
+
+claude --teammate-mode tmux
+```
+
+All three pieces matter.
+The shim's bin directory must be on the PATH of the CC process itself, not just a child shell it later spawns.
+`TMUX` must be set so CC's tmux-backend detector (`insideTmux`) reports true.
+`TMUX_PANE` should match the pane id you are actually in; the shim will allocate one if it is missing, but setting it explicitly keeps CC's view of the "current pane" consistent with WezTerm's.
+
+### Why not just flip settings.json globally
+
+CC's `teammateMode` setting is read once per session into a cached `BackendRegistry` selection, and that cached choice sticks for the session's lifetime.
+If you set `teammateMode: "tmux"` globally in `settings.json`, every interactive CC session on the machine will try to use the tmux backend, including ones whose process PATH does not have this shim, or that are not running inside WezTerm.
+Those sessions fail hard with an error like "To use agent swarms, you need tmux which requires WSL," and the broken backend stays cached for that session even if you revert `settings.json` afterward.
+The only fix at that point is starting a fresh session.
+The per-session `--teammate-mode tmux` flag avoids all of this: it only affects the session you launch it in, and CC propagates the same flag to any teammates it spawns.
+
+## Interactive-Only Limitation
+
+Agent-team pane spawning only works in an interactive TTY session.
+Non-interactive invocations (`-p`, piped input/output, or any non-interactive session) always force CC's in-process backend regardless of `teammateMode` or the `--teammate-mode` flag.
+There is no way to get pane-based teammates out of a `-p` invocation.
 
 ## How It Works
 
@@ -54,71 +130,50 @@ Supported `#{token}` values:
 - `#{client_termtype}` - always `tmux-256color`
 - `#{client_control_mode}` - always `0`
 
-## Build
+## Troubleshooting
 
-Requires Rust (MSVC toolchain) and VS Build Tools 2022 for the linker.
+Two logs cover the two sides of the integration.
 
-```powershell
-# Install VS Build Tools 2022 with C++ workload
-winget install Microsoft.VisualStudio.2022.BuildTools ...
+CC's own backend selection: launch with `claude --debug-file <path>`, then search the file for `[BackendRegistry] Selected:`.
+`Selected: tmux (running inside tmux session)` confirms CC picked the tmux backend; anything else means `TMUX` was not visible to the CC process, or `--teammate-mode tmux` was not passed.
 
-# Set up MSVC environment (one-time per shell session)
-# Adjust the MSVC version path to match your install
-$VCTools = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207"
-$WinSDK  = "C:\Program Files (x86)\Windows Kits\10\lib\10.0.26100.0"
-$env:LIB = "$VCTools\lib\x64;$WinSDK\um\x64;$WinSDK\ucrt\x64"
-$env:PATH = "$VCTools\bin\Hostx64\x64;" + $env:PATH
+The shim's own activity: `%LOCALAPPDATA%\wezterm-tmux-shim\shim.log` records every invocation - full argv, the `wezterm cli` command it ran, stdout, and exit code.
+If CC is calling the shim but panes are not appearing as expected, this is the first place to look.
 
-# Build
-cd C:\Users\you\Projects\wezterm-tmux-shim
-cargo build --release
-# Output: target\release\tmux.exe
-```
+See `docs/INTEGRATION_TESTING.md` for a full copy-pastable walkthrough with expected output at each step.
 
-## Install / Uninstall
+## Uninstall
 
-**Install (from repo root):**
-```powershell
-.\scripts\install.ps1
-```
-
-The script copies `tmux.exe` to `%LOCALAPPDATA%\wezterm-tmux-shim\bin\` and prints (does NOT apply) the steps to:
-
-- Prepend the install dir to PATH
-- Set `TMUX` and `TMUX_PANE` environment variables
-- Set `settings.json` teammate mode to `tmux`
-
-**Uninstall:**
 ```powershell
 .\scripts\uninstall.ps1
 ```
 
-Removes the install directory and restores the `settings.json` backup.
+Removes the install directory (`bin`, `state.json`, `shim.log`) and restores the `settings.json` backup if one exists.
+It does not touch PATH - if you added the shim's bin directory to a persistent PATH rather than per-session, remove it manually.
 
 ## Limitations / Version Drift
 
-This is a Phase-0 spike, not a production-grade implementation.
+This is a Phase-1 build verified against a single CC release; treat it as unsigned, best-effort automation rather than a maintained integration.
 
-- **new-session / new-window stubs:** These do not create real WezTerm tabs or sessions.
- They map the first live pane as a stub.
- CC may expect session isolation; this will not provide it.
+**Verified against `claude 2.1.196` only.**
+CC's internal tmux API surface is not a public contract and can change without notice in future releases.
+If subcommands or argument forms change, the shim logs `UNHANDLED: ...` and exits 0 rather than crashing CC, but the corresponding feature will silently not work.
+Check `shim.log` to detect drift.
 
-- **respawn-pane via send-text:** WezTerm has no API to kill and restart a pane process.
- The shim writes a `.cmd` launcher with stored env vars and sends it to the pane via `wezterm cli send-text --no-paste`.
- The target pane must have an idle shell that accepts input.
- If the pane is occupied (running a process), the keystrokes will be delivered to that process instead.
+**`new-session` / `new-window` are stubs.**
+They map the first live WezTerm pane rather than creating a real tab or session.
+CC may expect session isolation between agent teams; this does not provide it.
 
-- **Format token coverage:** Only the tokens CC was observed to use are implemented.
- Unknown tokens are left as-is in the output.
+**`respawn-pane` needs an idle shell.**
+WezTerm has no API to kill and restart a pane's process.
+The shim writes a `.cmd` launcher with stored env vars and sends it to the target pane via `wezterm cli send-text --no-paste`.
+This only works if the target pane is sitting at an idle shell prompt; if it is running another process, the keystrokes go to that process instead.
 
-- **Version drift:** If CC emits new subcommands or changed argument forms after `claude 2.1.196`, the shim logs `UNHANDLED: ...` and exits 0.
- Check `shim.log` to detect drift.
+**Format token coverage is limited** to the tokens CC was observed to use.
+Unknown `#{...}` tokens are left as-is in the output.
 
-- **Build toolchain:** The MSVC target is required on machines with endpoint security (CrowdStrike Falcon, etc.) that quarantine unsigned binaries from unknown compilers.
- The GNU (MinGW) toolchain build also works but may be blocked.
-
-- **Code signing:** The shim is not code-signed.
- Enterprise policies may block it regardless of toolchain.
+**Not code-signed.**
+Enterprise endpoint security (CrowdStrike Falcon and similar) may block or quarantine the binary regardless of which toolchain built it.
 
 ## Debug Log
 

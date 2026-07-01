@@ -162,3 +162,47 @@ Generic `CLAUDE_CODE_*` names are stored - any `set-environment -g NAME VALUE` c
 - W3 (respawn-pane env value escaping): src/main.rs `cmd_respawn_pane` - env values now also strip CR/LF in addition to doubling `%`, preventing batch command injection via a stored env var containing a newline.
 
 Fix round 1 applied. Code compiles. Self-test deferred pending WezTerm restart.
+
+## Phase 1: Production Build
+
+Generated: 2026-07-01
+Verified against: claude 2.1.196
+
+### NF2 fail-soft locking
+
+`load_state_locked` previously called `.expect()` on both opening the lock file and acquiring the exclusive lock.
+On a read-only `%LOCALAPPDATA%`, either call would panic and crash the shim, defeating the fail-soft design used everywhere else in `main.rs`.
+
+Fix: the lock handle is now `Option<fs::File>`.
+On open failure or lock failure, the shim logs the error via `log_line` and returns loaded-or-default state with `None` in place of the lock, rather than panicking.
+`main()` already destructured the return value as `let (mut state, _lock) = load_state_locked();`, so the call site needed no change - only the inferred type of `_lock` changed.
+State is still read and returned normally in this fallback path; only the exclusive-lock guarantee is given up, which only matters under concurrent shim invocations racing on the same state file.
+
+`cargo build --release` passes after the change.
+
+### BackendRegistry and `--teammate-mode` findings
+
+Read-only binary analysis and live testing against `claude 2.1.196` established how CC selects its agent-teams backend:
+
+- The backend choice is cached per session (`[BackendRegistry] Using cached backend`) once selected; it does not re-evaluate mid-session.
+- The tmux backend is selected when `process.env.TMUX` is set (detector `insideTmux`); success is logged as `[BackendRegistry] Selected: tmux (running inside tmux session)`.
+- Non-interactive sessions (`-p`, piped I/O) always force the in-process backend, regardless of `teammateMode`.
+  Pane-based teammates only ever spawn from an interactive TTY session.
+- CC exposes a per-invocation CLI flag, `--teammate-mode <tmux|iterm2|in-process|auto>`, which it also propagates to any teammates it spawns.
+
+### The global-flip hazard
+
+Setting `teammateMode: "tmux"` globally in CC's `settings.json` was tested live and confirmed harmful: it makes every interactive CC session attempt the tmux backend, including sessions whose process PATH lacks the shim.
+Those sessions fail hard ("To use agent swarms, you need tmux which requires WSL"), and the broken backend selection is cached for the session's remaining lifetime - reverting `settings.json` afterward does not recover an already-broken session; only a fresh session does.
+
+Recommendation adopted throughout the docs: use the per-session `--teammate-mode tmux` flag plus session-scoped `PATH`/`TMUX`/`TMUX_PANE`, and never flip the global setting.
+
+### Docs added
+
+- `README.md`: rewritten for production use - requirements, build, install, an Activation section covering the safe per-session flag and the global-flip hazard, the interactive-only (`-p`) limitation, troubleshooting via `--debug-file` and `shim.log`, uninstall, and an expanded Limitations/Version Drift section.
+- `docs/INTEGRATION_TESTING.md`: new file - a copy-pastable human recipe for confirming `[BackendRegistry] Selected: tmux` and a real WezTerm pane spawn, including the open question that the exact prompt phrasing needed to trigger `launchSwarm` is still unconfirmed and remains the one manual validation step.
+
+### Known gap carried forward
+
+`scripts/install.ps1` still prints a step recommending a global `settings.json` teammateMode change; this predates the Phase 1 findings above and was out of scope for this build (not listed in the Phase 1 task brief).
+It should be revisited to align with the per-session activation guidance now documented in the README.
