@@ -74,6 +74,14 @@ The shim's bin directory must be on the PATH of the CC process itself, not just 
 `TMUX` must be set so CC's tmux-backend detector (`insideTmux`) reports true.
 `TMUX_PANE` should match the pane id you are actually in; the shim will allocate one if it is missing, but setting it explicitly keeps CC's view of the "current pane" consistent with WezTerm's.
 
+Rather than typing the steps above by hand each session, run [`scripts/launch-team.ps1`](scripts/launch-team.ps1).
+It applies the same per-session flag and environment variables and supersedes any ad hoc personal launcher script.
+
+### Natural activation (no manual steps each session)
+
+The steps above are manual and per-session.
+See [docs/ACTIVATION.md](docs/ACTIVATION.md) for how to fold the PATH/TMUX/TMUX_PANE setup into WezTerm or shell config so it applies automatically inside every WezTerm pane.
+
 ### Why not just flip settings.json globally
 
 CC's `teammateMode` setting is read once per session into a cached `BackendRegistry` selection, and that cached choice sticks for the session's lifetime.

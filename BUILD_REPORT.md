@@ -1,4 +1,4 @@
-# BUILD REPORT - wezterm-tmux-shim Phase-0 Spike
+﻿# BUILD REPORT - wezterm-tmux-shim Phase-0 Spike
 
 Generated: 2026-06-30
 Verified against: claude 2.1.196
@@ -270,4 +270,31 @@ After the teammate command line, it looks up `state.remain_on_exit.get(&wez_targ
 The env-export lines, the raw command line, and the `.cmd` wrapper + `send-text` delivery are all unchanged.
 
 Verified by exercising `cmd_set_option` with the exact argv CC sends (`set-option -p -t %N remain-on-exit failed`) followed by `cmd_respawn_pane`, and inspecting the generated `.sh` for all three `remain-on-exit` values in a scratch state directory (never the real one).
+`cargo build --release` passes with no warnings after this fix.
+
+### Fix Round 5: kill-pane/kill-window never closed teammate panes
+
+`cmd_split_window` and `cmd_respawn_pane` were already correct, but the dispatch table routed `kill-pane`, `kill-window`, and `kill-session` to the shared UNHANDLED no-op path.
+When CC or the user dismisses a teammate, or a teammate finishes its task, the teammate `claude` process stays alive and idle rather than exiting, so the remain-on-exit teardown appended in `cmd_respawn_pane` (Fix Round 4) never fires for it.
+The real close signal is CC issuing `tmux kill-pane`, which the shim was silently dropping, leaving the WezTerm pane open forever.
+
+**`cmd_kill_pane` is now handled.**
+It parses `-t <target>` (a tmux pane id like `%N`, a bare wezterm integer, or a window id `@N` resolved through the existing name/window fallback in `resolve_target`), defaulting to the current pane via `resolve_current_pane` when `-t` is absent, matching tmux's own default.
+It resolves the target to a wezterm pane id and runs `wezterm cli kill-pane --pane-id <id>`, logging the command and the wezterm exit code.
+It is fail-soft throughout: an unresolvable target or a nonzero wezterm exit is logged and the shim still returns exit 0, never panicking or crashing CC.
+A new `State::forget_pane` helper then removes the pane's `tmux_to_wez`/`wez_to_tmux` mapping and any `remain_on_exit` entry, best-effort and unconditional on the wezterm call's outcome, so a pane the shim believes is gone does not linger in `state.json` and get reused for a different pane later.
+
+**`cmd_kill_window` is now handled, best-effort.**
+It parses `-t @N` directly as a window id, or resolves a pane-style target to its window via `wezterm cli list`, then enumerates every live pane in that window and calls `wezterm cli kill-pane --pane-id <id>` on each, since WezTerm has no single "kill window" call.
+Each killed pane also goes through `State::forget_pane`.
+
+**`kill-session` intentionally remains on the UNHANDLED no-op path.**
+The shim tracks no concept of a tmux "session" as a specific set of panes; honoring `kill-session` would mean mass-killing every pane the shim knows about, which could tear down unrelated WezTerm panes or windows the user still cares about.
+A comment at the dispatch site documents this so the safety property is not silently lost in a future edit.
+
+This is the real teammate-pane close path.
+The remain-on-exit launcher teardown added in Fix Round 4 only covers processes that actually exit on their own; it is unchanged and still correct for short-lived commands, but it does not help for a dismissed or finished teammate whose `claude` process stays running.
+
+Verified against a scratch `LOCALAPPDATA` state directory (never the real one): `kill-pane -t %N` resolved the seeded tmux id to its wezterm pane id, emitted `wezterm cli kill-pane --pane-id <id>`, and removed the pane's `tmux_to_wez`/`wez_to_tmux`/`remain_on_exit` entries from `state.json` even when the underlying `wezterm` call failed (pane already gone).
+`kill-window -t @<nonexistent>` correctly matched zero real panes against a live WezTerm instance and killed nothing.
 `cargo build --release` passes with no warnings after this fix.

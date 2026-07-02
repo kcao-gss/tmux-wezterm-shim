@@ -1,4 +1,4 @@
-//! wezterm-tmux-shim: native Windows tmux.exe shim for Claude Code agent-teams.
+﻿//! wezterm-tmux-shim: native Windows tmux.exe shim for Claude Code agent-teams.
 //!
 //! Translates the tmux subcommands that CC TmuxBackend emits into wezterm cli
 //! calls. Verified against claude 2.1.196. Unknown subcommands are logged and
@@ -78,6 +78,17 @@ impl State {
         }
         self.tmux_to_wez.insert(tmux_id.to_string(), wez_id);
         self.wez_to_tmux.insert(wez_id, tmux_id.to_string());
+    }
+
+    /// Remove all bookkeeping for a WezTerm pane: its tmux id mapping (both
+    /// directions) and any remain-on-exit policy. Used when a pane is
+    /// actually destroyed (kill-pane/kill-window) so stale ids do not
+    /// accumulate in state.json.
+    fn forget_pane(&mut self, wez_id: u64) {
+        if let Some(tid) = self.wez_to_tmux.remove(&wez_id) {
+            self.tmux_to_wez.remove(&tid);
+        }
+        self.remain_on_exit.remove(&wez_id);
     }
 }
 
@@ -833,6 +844,109 @@ fn cmd_break_pane(_args: &[String], _state: &mut State) -> i32 {
     0
 }
 
+fn cmd_kill_pane(args: &[String], state: &mut State) -> i32 {
+    // kill-pane [-t <target>]
+    //
+    // This is the real teammate-pane close path: CC issues kill-pane when a
+    // teammate is dismissed or its task finishes, but the teammate claude
+    // process itself stays alive/idle rather than exiting, so the
+    // remain-on-exit teardown appended in cmd_respawn_pane never fires for
+    // it. Without honoring kill-pane, the WezTerm pane lingers forever.
+    //
+    // If -t is absent, tmux kills the current pane; we mirror that via
+    // resolve_current_pane.
+    let mut target = String::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                i += 1;
+                if i < args.len() {
+                    target = args[i].clone();
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let target = if target.is_empty() {
+        resolve_current_pane(state)
+    } else {
+        target
+    };
+    let wez_target = match resolve_target(&target, state) {
+        Some(id) => id,
+        None => {
+            log_line(&format!("  kill-pane: could not resolve target={}", target));
+            return 0;
+        }
+    };
+    log_line(&format!("  kill-pane: target={} wez_target={}", target, wez_target));
+    let pane_id_str = wez_target.to_string();
+    let (_, _, exit) = run_wezterm(&["cli", "kill-pane", "--pane-id", pane_id_str.as_str()]);
+    log_line(&format!("  kill-pane: wezterm exit={}", exit));
+    // Best-effort cleanup regardless of the wezterm call's outcome, so a
+    // pane we believe is gone does not linger in state and get reused.
+    state.forget_pane(wez_target);
+    save_state_locked(state);
+    0
+}
+
+fn cmd_kill_window(args: &[String], state: &mut State) -> i32 {
+    // kill-window [-t <target>]
+    //
+    // Best-effort: <target> may be a window id ("@N"), or a pane id/name that
+    // resolves to a pane whose window we then kill. Every live pane in that
+    // wezterm window is closed individually via wezterm cli kill-pane,
+    // since WezTerm has no single "kill window" call.
+    let mut target = String::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                i += 1;
+                if i < args.len() {
+                    target = args[i].clone();
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let panes = list_wez_panes();
+    let window_id: Option<u64> = if let Some(n) = target.strip_prefix('@') {
+        n.parse::<u64>().ok()
+    } else {
+        let pane_target = if target.is_empty() {
+            resolve_current_pane(state)
+        } else {
+            target.clone()
+        };
+        resolve_target(&pane_target, state).and_then(|wid| {
+            panes.iter().find(|p| p.pane_id == wid).map(|p| p.window_id)
+        })
+    };
+    let window_id = match window_id {
+        Some(w) => w,
+        None => {
+            log_line(&format!("  kill-window: could not resolve target={}", target));
+            return 0;
+        }
+    };
+    log_line(&format!("  kill-window: window_id={}", window_id));
+    for p in panes.iter().filter(|p| p.window_id == window_id) {
+        let pane_id_str = p.pane_id.to_string();
+        let (_, _, exit) = run_wezterm(&["cli", "kill-pane", "--pane-id", pane_id_str.as_str()]);
+        log_line(&format!(
+            "  kill-window: killed pane_id={} exit={}",
+            p.pane_id, exit
+        ));
+        state.forget_pane(p.pane_id);
+    }
+    save_state_locked(state);
+    0
+}
+
 // ----- dispatch -----
 
 fn dispatch(subcommand: &str, args: &[String], state: &mut State) -> i32 {
@@ -850,6 +964,13 @@ fn dispatch(subcommand: &str, args: &[String], state: &mut State) -> i32 {
         "set-environment" | "set" => cmd_set_environment(args, state),
         "show-environment" => cmd_show_environment(args, state),
         "break-pane" => cmd_break_pane(args, state),
+        "kill-pane" => cmd_kill_pane(args, state),
+        "kill-window" => cmd_kill_window(args, state),
+        // kill-session intentionally stays on the UNHANDLED no-op path below:
+        // it would otherwise mean mass-killing every pane the shim knows
+        // about, which could tear down unrelated WezTerm panes/windows the
+        // user still cares about. Only pane- and window-scoped kills are
+        // honored.
         other => {
             // Fail-soft: log and exit 0 so CC does not crash on version drift.
             log_line(&format!("UNHANDLED: subcommand={:?} args={:?}", other, args));
