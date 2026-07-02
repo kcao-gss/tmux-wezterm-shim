@@ -56,31 +56,35 @@ Because the whole block is gated on `$env:WEZTERM_PANE`, opening a non-WezTerm s
 Approach A and Approach B are alternatives, not additions; pick one.
 If you apply both, the effect is the same, just redundant.
 
-## 4. The `--teammate-mode tmux` flag: open question
+## 4. The `--teammate-mode tmux` flag is required (confirmed)
 
-It is not yet confirmed whether CC auto-selects the tmux teammate backend purely from `TMUX` being set (its `BackendRegistry` "running inside tmux session" path), with no `--teammate-mode` flag at all.
-If auto-detection works, Approaches A and B above are sufficient on their own and the flag becomes unnecessary.
+A live test has confirmed that CC does not auto-select the tmux teammate backend purely from `TMUX` being set.
+The `--teammate-mode tmux` flag (or the documented-hazardous global `settings.json` override, which this project does not recommend) is required; `TMUX` being set alone is not sufficient.
 
-### One-step test
+### How this was verified
 
-With the environment from Approach A or B active in a WezTerm pane, run:
+With the environment from Approach A or B active in a WezTerm pane, this command was run:
 
 ```powershell
 claude --debug-file "$env:LOCALAPPDATA\wezterm-tmux-shim\cc-debug.log"
 ```
 
-Deliberately omit `--teammate-mode tmux`.
-Dispatch a teammate (see docs/INTEGRATION_TESTING.md Step 5 for how to prompt CC into calling `launchSwarm`), then check the debug log:
+`--teammate-mode tmux` was deliberately omitted.
+A teammate was then dispatched (see docs/INTEGRATION_TESTING.md Step 5 for how to prompt CC into calling `launchSwarm`), and the debug log was checked:
 
 ```powershell
 Select-String -Path "$env:LOCALAPPDATA\wezterm-tmux-shim\cc-debug.log" -Pattern "\[BackendRegistry\]|\[TeammateModeSnapshot\]"
 ```
 
-If the log shows `Selected: tmux (running inside tmux session)`, auto-detection works and no flag or alias is needed.
+The log showed `[TeammateModeSnapshot] Captured from config: in-process`, followed by `[BackendRegistry] isInProcessEnabled: true (mode=in-process, insideTmux=true, inITerm2=false)` for the rest of the session.
+Notably, `insideTmux=true` was correctly detected, so CC did see `TMUX`.
+Even so, CC fell back to in-process mode from config because no explicit tmux signal (flag or the hazardous global `settings.json` override) was given.
+This contrasts with confirmed-working sessions elsewhere in this project's testing, which show `[TeammateModeSnapshot] Captured from CLI override: tmux` when the flag is passed.
+This recipe remains useful as a repro if you want to re-verify behavior on a different Claude Code version.
 
-### Fallback if auto-detection does not fire
+### Required: the flag or a shell alias
 
-If the backend selection comes back as something other than tmux, add a WezTerm-gated PowerShell function that appends the flag automatically, so you still never have to type it by hand.
+Because the flag is required, add a WezTerm-gated PowerShell function that appends it automatically, so you still never have to type it by hand.
 Add this to `$PROFILE`, after the block from Approach B (or standalone if you used Approach A):
 
 ```powershell
@@ -92,6 +96,7 @@ if ($env:WEZTERM_PANE) {
 ```
 
 This only shadows `claude` inside a WezTerm pane; a plain shell outside WezTerm still calls the real `claude.exe` with no flag added.
+Alternatively, this repo's `scripts/launch-team.ps1` already includes the flag, so launching through that script is a simpler way to always pass it without editing your profile.
 Do not set `teammateMode` globally in `settings.json` as an alternative to this - that is a documented hazard in the top-level README's Activation section, not a viable shortcut.
 
 ## 5. The superpowers skill tension
