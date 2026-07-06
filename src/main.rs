@@ -971,9 +971,27 @@ fn dispatch(subcommand: &str, args: &[String], state: &mut State) -> i32 {
         // about, which could tear down unrelated WezTerm panes/windows the
         // user still cares about. Only pane- and window-scoped kills are
         // honored.
+
+        // Known-accepted no-ops (GitHub #6): subcommands CC may emit that
+        // this shim intentionally does not act on. Exit 0, make no wezterm
+        // call, and log a distinct NOOP line so a future shim.log audit can
+        // tell a deliberate no-op apart from a never-seen UNHANDLED
+        // subcommand.
+        "select-layout" | "refresh-client" | "set-window-option" | "setw" | "rename-window"
+        | "rename-session" | "move-window" | "swap-pane" => {
+            log_line(&format!("NOOP: {} (known-accepted no-op)", subcommand));
+            0
+        }
         other => {
-            // Fail-soft: log and exit 0 so CC does not crash on version drift.
+            // Fail-soft: log and exit 0 so CC does not crash on version drift,
+            // but also tell ad-hoc/manual users on stderr that this
+            // subcommand is not implemented (GitHub #1), so they can tell
+            // "not implemented" apart from silent success.
             log_line(&format!("UNHANDLED: subcommand={:?} args={:?}", other, args));
+            eprintln!(
+                "tmux-wezterm-shim: unhandled subcommand '{}' (not implemented - see shim.log)",
+                other
+            );
             0
         }
     }

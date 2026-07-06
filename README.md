@@ -128,7 +128,8 @@ The version string is embedded in the binary and printed by `tmux.exe -V`.
 | `set-environment -g <NAME> <VALUE>` | Stores in state file. |
 | `show-environment -g <NAME>` | Reads from state file. |
 | `break-pane ...` | No-op (exit 0). |
-| Unknown subcommand | Logs `UNHANDLED: ...` and exits 0 (fail-soft). |
+| `select-layout`, `refresh-client`, `set-window-option`/`setw`, `rename-window`, `rename-session`, `move-window`, `swap-pane` | Known-accepted no-op (exit 0, no wezterm call). |
+| Unknown subcommand | Logs `UNHANDLED: ...` and exits 0 (fail-soft); also prints a one-line hint to stderr. |
 
 ## Format Tokens
 
@@ -148,6 +149,9 @@ CC's own backend selection: launch with `claude --debug-file <path>`, then searc
 
 The shim's own activity: `%LOCALAPPDATA%\wezterm-tmux-shim\shim.log` records every invocation - full argv, the `wezterm cli` command it ran, stdout, and exit code.
 If CC is calling the shim but panes are not appearing as expected, this is the first place to look.
+
+If you invoke the shim manually and a subcommand does nothing, check stderr first.
+A truly unhandled subcommand prints `tmux-wezterm-shim: unhandled subcommand '<name>' (not implemented - see shim.log)`; a known-accepted no-op (see the Supported Subcommands table) does not print anything to stderr, only a `NOOP: ...` line in `shim.log`.
 
 See `docs/INTEGRATION_TESTING.md` for a full copy-pastable walkthrough with expected output at each step.
 
