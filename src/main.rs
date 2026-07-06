@@ -121,6 +121,7 @@ fn load_state_locked() -> (State, Option<fs::File>) {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(dir.join("state.lock"))
     {
         Ok(f) => match f.lock_exclusive() {
@@ -245,7 +246,7 @@ fn run_wezterm(args: &[&str]) -> (String, String, i32) {
 ///   2. The default Git-for-Windows install location (64-bit layout).
 ///   3. The default Git-for-Windows install location (usr/bin layout).
 ///   4. Bare "bash" resolved via PATH, as a last resort.
-/// Returns None if nothing is found; callers must fail soft.
+///      Returns None if nothing is found; callers must fail soft.
 fn bash_bin() -> Option<String> {
     if let Ok(shell) = std::env::var("SHELL") {
         if !shell.is_empty() && PathBuf::from(&shell).is_file() {
@@ -764,7 +765,7 @@ fn cmd_respawn_pane(args: &[String], state: &mut State) -> i32 {
         // Strip CR/LF to prevent script injection via a stored env var, then
         // single-quote the value using the standard bash escaping idiom:
         // close the quote, emit an escaped literal quote, reopen the quote.
-        let clean_v = v.replace('\r', "").replace('\n', "");
+        let clean_v = v.replace(['\r', '\n'], "");
         let escaped_v = clean_v.replace('\'', r"'\''");
         sh_lines.push(format!("export {}='{}'", k, escaped_v));
     }
@@ -1156,14 +1157,11 @@ fn cmd_kill_pane(args: &[String], state: &mut State) -> i32 {
     let mut target = String::new();
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "-t" => {
-                i += 1;
-                if i < args.len() {
-                    target = args[i].clone();
-                }
+        if args[i].as_str() == "-t" {
+            i += 1;
+            if i < args.len() {
+                target = args[i].clone();
             }
-            _ => {}
         }
         i += 1;
     }
@@ -1200,14 +1198,11 @@ fn cmd_kill_window(args: &[String], state: &mut State) -> i32 {
     let mut target = String::new();
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "-t" => {
-                i += 1;
-                if i < args.len() {
-                    target = args[i].clone();
-                }
+        if args[i].as_str() == "-t" {
+            i += 1;
+            if i < args.len() {
+                target = args[i].clone();
             }
-            _ => {}
         }
         i += 1;
     }
