@@ -177,7 +177,25 @@ fn log_line(msg: &str) {
 }
 // ----- wezterm binary resolution -----
 
+/// Trim and validate a WEZTERM_TMUX_SHIM_CLI env var value: blank (empty or
+/// whitespace-only) or absent means "no override", matching how the other
+/// env-var-driven fallbacks in this file (e.g. SHELL in bash_bin) treat an
+/// empty value as unset.
+fn wezterm_override_from_env(val: Option<String>) -> Option<String> {
+    let v = val?;
+    let trimmed = v.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 fn wezterm_bin() -> String {
+    // Explicit override takes priority over every other lookup.
+    if let Some(bin) = wezterm_override_from_env(std::env::var("WEZTERM_TMUX_SHIM_CLI").ok()) {
+        return bin;
+    }
     // Try PATH first; fall back to the default WezTerm install location.
     let candidate = "wezterm";
     let ok = Command::new(candidate)
@@ -1403,5 +1421,20 @@ mod tests {
         assert!(json.contains("tmux_to_wez"));
         assert!(json.contains("%0"));
         assert!(json.contains("42"));
+    }
+
+    #[test]
+    fn wezterm_override_from_env_trims_whitespace() {
+        assert_eq!(
+            wezterm_override_from_env(Some("  C:\\custom\\wezterm.exe  ".to_string())),
+            Some("C:\\custom\\wezterm.exe".to_string())
+        );
+    }
+
+    #[test]
+    fn wezterm_override_from_env_rejects_blank_or_missing() {
+        assert_eq!(wezterm_override_from_env(Some("   ".to_string())), None);
+        assert_eq!(wezterm_override_from_env(Some(String::new())), None);
+        assert_eq!(wezterm_override_from_env(None), None);
     }
 }
