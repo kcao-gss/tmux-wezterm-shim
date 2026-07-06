@@ -18,6 +18,7 @@ See `docs/INTEGRATION_TESTING.md` for the mechanics of how CC picks this backend
 
 - Windows 10/11.
 - [WezTerm](https://wezterm.org/) installed, with `wezterm.exe` either on PATH or in its default `%ProgramFiles%\WezTerm\` location.
+  If neither applies (a portable install, a non-default location, or you just want to pin a specific binary), set `WEZTERM_TMUX_SHIM_CLI` to the full path of `wezterm.exe` and the shim will use it verbatim, skipping both the PATH lookup and the default-location fallback.
 - [Git for Windows](https://git-scm.com/download/win) installed, so `bash.exe` is available for teammate command execution (see respawn-pane in Supported Subcommands).
 - Rust (MSVC toolchain) and VS Build Tools 2022, if building from source.
 - Claude Code, verified against `claude 2.1.196` (see Limitations below for version-drift risk).
@@ -125,6 +126,10 @@ The version string is embedded in the binary and printed by `tmux.exe -V`.
 | `set-option ...` | No-op (exit 0). |
 | `resize-pane ...` | No-op (exit 0). |
 | `respawn-pane -k -t <target> -- <cmd>` | Writes a bash `.sh` launcher plus a `.cmd` wrapper that invokes it via Git bash; sends the `.cmd` path to the pane via send-text. |
+| `send-keys [-l] -t <target> <key/text> ...` | Calls `wezterm cli send-text --no-paste`; translates key names (`Enter`/`C-m`, `Tab`, `Space`, `C-<letter>`) unless `-l` (literal) is given. |
+| `capture-pane -t <target> [-p] [-S <start>] [-E <end>] [-e]` | Calls `wezterm cli get-text`; prints to stdout only when `-p` is given. |
+| `doctor` | Scriptable self-diagnostic; prints a report and exits nonzero if any check fails (see Troubleshooting). |
+| `dump-state` | Pretty-prints the current state file contents as JSON to stdout. Read-only. |
 | `set-environment -g <NAME> <VALUE>` | Stores in state file. |
 | `show-environment -g <NAME>` | Reads from state file. |
 | `break-pane ...` | No-op (exit 0). |
@@ -141,6 +146,12 @@ Supported `#{token}` values:
 - `#{client_control_mode}` - always `0`
 
 ## Troubleshooting
+
+Run `tmux doctor` first.
+It checks the resolved `wezterm.exe` path and whether `wezterm --version` succeeds, whether the state file's directory is readable/writable, the current WezTerm pane count, and whether `bash.exe` is locatable.
+It prints a report and exits 0 only if every check passes, so it can be dropped into a setup script or CI check.
+
+If `wezterm.exe` cannot be found on PATH or at its default `%ProgramFiles%\WezTerm\` location, set `WEZTERM_TMUX_SHIM_CLI` to its full path and re-run `tmux doctor` to confirm the override took effect.
 
 Two logs cover the two sides of the integration.
 
@@ -205,3 +216,4 @@ It records the full argv, every `wezterm cli` call, stdout, and exit codes.
 
 `%LOCALAPPDATA%\wezterm-tmux-shim\state.json` stores the tmux-to-WezTerm pane id mapping and any environment variables set via `set-environment`.
 Delete this file to reset all id mappings.
+Run `tmux dump-state` to pretty-print its current contents to stdout without opening the file directly.
