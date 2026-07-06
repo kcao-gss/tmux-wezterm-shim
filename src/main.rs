@@ -1263,11 +1263,18 @@ fn dispatch(subcommand: &str, args: &[String], state: &mut State) -> i32 {
         "capture-pane" => cmd_capture_pane(args, state),
         "doctor" => cmd_doctor(args, state),
         "dump-state" => cmd_dump_state(args, state),
-        // kill-session intentionally stays on the UNHANDLED no-op path below:
-        // it would otherwise mean mass-killing every pane the shim knows
-        // about, which could tear down unrelated WezTerm panes/windows the
-        // user still cares about. Only pane- and window-scoped kills are
+        // kill-session now has its own dedicated refusal arm below: acting
+        // on it would mean mass-killing every pane the shim knows about,
+        // which could tear down unrelated WezTerm panes/windows the user
+        // still cares about. Only pane- and window-scoped kills are
         // honored.
+        "kill-session" => {
+            log_line("REFUSED: kill-session ignored by design (would tear down unrelated panes/windows)");
+            eprintln!(
+                "tmux-wezterm-shim: kill-session ignored by design (would kill unrelated panes/windows - see shim.log). Use kill-pane or kill-window instead."
+            );
+            0
+        }
 
         // Known-accepted no-ops (GitHub #6): subcommands CC may emit that
         // this shim intentionally does not act on. Exit 0, make no wezterm
