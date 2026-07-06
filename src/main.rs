@@ -1078,6 +1078,21 @@ fn cmd_doctor(_args: &[String], _state: &mut State) -> i32 {
     exit_code
 }
 
+// ----- dump-state -----
+
+/// Pretty-print the currently loaded State as indented JSON. Read-only: no
+/// mutation, no side effects. Uses the same serde_json::to_string_pretty
+/// call save_state_locked already relies on, so the output matches what is
+/// actually persisted to state.json.
+fn dump_state_json(state: &State) -> String {
+    serde_json::to_string_pretty(state).unwrap_or_default()
+}
+
+fn cmd_dump_state(_args: &[String], state: &mut State) -> i32 {
+    println!("{}", dump_state_json(state));
+    0
+}
+
 fn cmd_set_environment(args: &[String], state: &mut State) -> i32 {
     // set-environment -g <NAME> <VALUE>
     // Also: set -as <...> accepted as no-op-ok.
@@ -1234,6 +1249,7 @@ fn dispatch(subcommand: &str, args: &[String], state: &mut State) -> i32 {
         "send-keys" => cmd_send_keys(args, state),
         "capture-pane" => cmd_capture_pane(args, state),
         "doctor" => cmd_doctor(args, state),
+        "dump-state" => cmd_dump_state(args, state),
         // kill-session intentionally stays on the UNHANDLED no-op path below:
         // it would otherwise mean mass-killing every pane the shim knows
         // about, which could tear down unrelated WezTerm panes/windows the
@@ -1377,5 +1393,15 @@ mod tests {
     #[test]
     fn doctor_exit_code_nonzero_when_any_check_fails() {
         assert_eq!(doctor_exit_code(&[true, false, true, true]), 1);
+    }
+
+    #[test]
+    fn dump_state_json_pretty_prints_pane_mapping() {
+        let mut state = State::default();
+        state.alloc_pane(42);
+        let json = dump_state_json(&state);
+        assert!(json.contains("tmux_to_wez"));
+        assert!(json.contains("%0"));
+        assert!(json.contains("42"));
     }
 }
