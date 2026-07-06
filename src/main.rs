@@ -177,7 +177,25 @@ fn log_line(msg: &str) {
 }
 // ----- wezterm binary resolution -----
 
+/// Trim and validate a WEZTERM_TMUX_SHIM_CLI env var value: blank (empty or
+/// whitespace-only) or absent means "no override", matching how the other
+/// env-var-driven fallbacks in this file (e.g. SHELL in bash_bin) treat an
+/// empty value as unset.
+fn wezterm_override_from_env(val: Option<String>) -> Option<String> {
+    let v = val?;
+    let trimmed = v.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 fn wezterm_bin() -> String {
+    // Explicit override takes priority over every other lookup.
+    if let Some(bin) = wezterm_override_from_env(std::env::var("WEZTERM_TMUX_SHIM_CLI").ok()) {
+        return bin;
+    }
     // Try PATH first; fall back to the default WezTerm install location.
     let candidate = "wezterm";
     let ok = Command::new(candidate)
@@ -813,6 +831,286 @@ fn cmd_respawn_pane(args: &[String], state: &mut State) -> i32 {
     ]);
     0
 }
+// ----- send-keys key translation -----
+
+/// Translate a single non-literal send-keys token into the string that
+/// should actually be sent to the pane. tmux key names we recognize are
+/// mapped to their control sequence; anything else (including symbolic key
+/// names we do not know about) is passed through as literal text, matching
+/// tmux's own fallback of treating an unrecognized token as literal input.
+fn translate_key_token(token: &str) -> String {
+    match token {
+        "Enter" | "C-m" => "\r".to_string(),
+        "Tab" => "\t".to_string(),
+        "Space" => " ".to_string(),
+        _ => {
+            if let Some(rest) = token.strip_prefix("C-") {
+                let mut chars = rest.chars();
+                if let (Some(c), None) = (chars.next(), chars.next()) {
+                    if c.is_ascii_alphabetic() {
+                        let ctrl = c.to_ascii_uppercase() as u8 - b'A' + 1;
+                        return (ctrl as char).to_string();
+                    }
+                }
+            }
+            token.to_string()
+        }
+    }
+}
+
+/// Build the text to hand to `wezterm cli send-text` for a send-keys
+/// invocation. In literal mode (-l) tokens are simply space-joined and sent
+/// verbatim - tmux's -l treats all remaining arguments as a single literal
+/// string. Otherwise each token is translated individually (recognized key
+/// name -> control sequence, else literal text) and concatenated with no
+/// separator, since tmux never inserts implied whitespace between separate
+/// key/text arguments.
+fn build_send_text(tokens: &[String], literal: bool) -> String {
+    if literal {
+        tokens.join(" ")
+    } else {
+        tokens.iter().map(|t| translate_key_token(t.as_str())).collect()
+    }
+}
+
+fn cmd_send_keys(args: &[String], state: &mut State) -> i32 {
+    // send-keys [-l] -t <target> <key/text> [<key/text> ...]
+    let mut target = String::new();
+    let mut literal = false;
+    let mut tokens: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                i += 1;
+                if i < args.len() {
+                    target = args[i].clone();
+                }
+            }
+            "-l" => literal = true,
+            _ => tokens.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    // resolve_current_pane already prefers WEZTERM_PANE (see its own doc
+    // comment), so no separate WEZTERM_PANE check is needed here.
+    let target = if target.is_empty() {
+        resolve_current_pane(state)
+    } else {
+        target
+    };
+    let wez_target = match resolve_target(&target, state) {
+        Some(id) => id,
+        None => {
+            log_line(&format!("  send-keys: could not resolve target={}", target));
+            return 0;
+        }
+    };
+    let text = build_send_text(&tokens, literal);
+    let pane_id_str = wez_target.to_string();
+    log_line(&format!(
+        "  send-keys: target={} wez_target={} literal={} text={:?}",
+        target, wez_target, literal, text
+    ));
+    run_wezterm(&[
+        "cli",
+        "send-text",
+        "--pane-id",
+        pane_id_str.as_str(),
+        "--no-paste",
+        text.as_str(),
+    ]);
+    0
+}
+
+// ----- capture-pane -----
+
+/// Parsed capture-pane flags. `start`/`end` are kept as the raw string tmux
+/// gave us (they can be negative, meaning "into the scrollback") since
+/// `wezterm cli get-text --start-line/--end-line` accepts the same signed
+/// line-number convention directly - no reinterpretation needed.
+struct CapturePaneOpts {
+    target: String,
+    print: bool,
+    start: Option<String>,
+    end: Option<String>,
+    escapes: bool,
+}
+
+fn parse_capture_pane_args(args: &[String]) -> CapturePaneOpts {
+    let mut opts = CapturePaneOpts {
+        target: String::new(),
+        print: false,
+        start: None,
+        end: None,
+        escapes: false,
+    };
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                i += 1;
+                if i < args.len() {
+                    opts.target = args[i].clone();
+                }
+            }
+            "-p" => opts.print = true,
+            "-e" => opts.escapes = true,
+            "-S" => {
+                i += 1;
+                if i < args.len() {
+                    opts.start = Some(args[i].clone());
+                }
+            }
+            "-E" => {
+                i += 1;
+                if i < args.len() {
+                    opts.end = Some(args[i].clone());
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    opts
+}
+
+fn cmd_capture_pane(args: &[String], state: &mut State) -> i32 {
+    // capture-pane -t <target> [-p] [-S <start>] [-E <end>] [-e]
+    //
+    // Maps directly onto `wezterm cli get-text`, which (unlike a fallback
+    // full-text-then-slice approach) supports --start-line/--end-line with
+    // the same signed line-number convention tmux uses (0 = top of screen,
+    // negative = into scrollback). -p is effectively the only supported
+    // mode here - there is no tmux paste-buffer equivalent in WezTerm, so
+    // capturing without -p is a fail-soft no-op (nothing to do with the
+    // text otherwise).
+    let opts = parse_capture_pane_args(args);
+    let target = if opts.target.is_empty() {
+        resolve_current_pane(state)
+    } else {
+        opts.target
+    };
+    let wez_target = match resolve_target(&target, state) {
+        Some(id) => id,
+        None => {
+            log_line(&format!("  capture-pane: could not resolve target={}", target));
+            return 0;
+        }
+    };
+    let pane_id_str = wez_target.to_string();
+    let mut wez_args = vec!["cli", "get-text", "--pane-id", pane_id_str.as_str()];
+    if let Some(s) = opts.start.as_deref() {
+        wez_args.push("--start-line");
+        wez_args.push(s);
+    }
+    if let Some(e) = opts.end.as_deref() {
+        wez_args.push("--end-line");
+        wez_args.push(e);
+    }
+    if opts.escapes {
+        wez_args.push("--escapes");
+    }
+    let (stdout, _, _) = run_wezterm(&wez_args);
+    if opts.print {
+        print!("{}", stdout);
+    } else {
+        log_line("  capture-pane: -p not set; nothing to output (no tmux paste-buffer equivalent)");
+    }
+    0
+}
+
+// ----- doctor -----
+
+/// Overall doctor exit code: 0 only if every individual check passed, 1
+/// otherwise, so `tmux doctor` (unlike every other subcommand here) is
+/// scriptable rather than fail-soft.
+fn doctor_exit_code(checks: &[bool]) -> i32 {
+    if checks.iter().all(|c| *c) {
+        0
+    } else {
+        1
+    }
+}
+
+fn doctor_status(ok: bool) -> &'static str {
+    if ok {
+        "OK"
+    } else {
+        "FAIL"
+    }
+}
+
+fn cmd_doctor(_args: &[String], _state: &mut State) -> i32 {
+    // doctor: a scriptable self-diagnostic. Unlike every other subcommand in
+    // this shim, this one is intentionally NOT fail-soft - its whole purpose
+    // is to report real failures with a nonzero exit code so it can be used
+    // in a setup script or CI check.
+    println!("wezterm-tmux-shim doctor");
+
+    let wezterm_path = wezterm_bin();
+    let (_, _, version_exit) = run_wezterm(&["--version"]);
+    let wezterm_ok = version_exit == 0;
+    println!(
+        "  wezterm binary: {} [{}]",
+        wezterm_path,
+        doctor_status(wezterm_ok)
+    );
+
+    let state_file = state_path();
+    let dir = state_dir();
+    let _ = fs::create_dir_all(&dir);
+    let probe = dir.join(".doctor_probe");
+    let state_ok = fs::write(&probe, b"probe").is_ok();
+    let _ = fs::remove_file(&probe);
+    println!(
+        "  state file: {} [{}]",
+        state_file.display(),
+        doctor_status(state_ok)
+    );
+
+    let (pane_stdout, _, pane_exit) = run_wezterm(&["cli", "list", "--format", "json"]);
+    let panes_ok = pane_exit == 0;
+    let pane_count = serde_json::from_str::<Vec<WezPane>>(&pane_stdout)
+        .map(|p| p.len())
+        .unwrap_or(0);
+    println!(
+        "  pane count: {} [{}]",
+        pane_count,
+        doctor_status(panes_ok)
+    );
+
+    let bash_found = bash_bin();
+    let bash_ok = bash_found.is_some();
+    println!(
+        "  bash.exe: {} [{}]",
+        bash_found.unwrap_or_else(|| "not found".to_string()),
+        doctor_status(bash_ok)
+    );
+
+    let exit_code = doctor_exit_code(&[wezterm_ok, state_ok, panes_ok, bash_ok]);
+    println!(
+        "Overall: {}",
+        if exit_code == 0 { "PASS" } else { "FAIL" }
+    );
+    exit_code
+}
+
+// ----- dump-state -----
+
+/// Pretty-print the currently loaded State as indented JSON. Read-only: no
+/// mutation, no side effects. Uses the same serde_json::to_string_pretty
+/// call save_state_locked already relies on, so the output matches what is
+/// actually persisted to state.json.
+fn dump_state_json(state: &State) -> String {
+    serde_json::to_string_pretty(state).unwrap_or_default()
+}
+
+fn cmd_dump_state(_args: &[String], state: &mut State) -> i32 {
+    println!("{}", dump_state_json(state));
+    0
+}
+
 fn cmd_set_environment(args: &[String], state: &mut State) -> i32 {
     // set-environment -g <NAME> <VALUE>
     // Also: set -as <...> accepted as no-op-ok.
@@ -966,14 +1264,36 @@ fn dispatch(subcommand: &str, args: &[String], state: &mut State) -> i32 {
         "break-pane" => cmd_break_pane(args, state),
         "kill-pane" => cmd_kill_pane(args, state),
         "kill-window" => cmd_kill_window(args, state),
+        "send-keys" => cmd_send_keys(args, state),
+        "capture-pane" => cmd_capture_pane(args, state),
+        "doctor" => cmd_doctor(args, state),
+        "dump-state" => cmd_dump_state(args, state),
         // kill-session intentionally stays on the UNHANDLED no-op path below:
         // it would otherwise mean mass-killing every pane the shim knows
         // about, which could tear down unrelated WezTerm panes/windows the
         // user still cares about. Only pane- and window-scoped kills are
         // honored.
+
+        // Known-accepted no-ops (GitHub #6): subcommands CC may emit that
+        // this shim intentionally does not act on. Exit 0, make no wezterm
+        // call, and log a distinct NOOP line so a future shim.log audit can
+        // tell a deliberate no-op apart from a never-seen UNHANDLED
+        // subcommand.
+        "select-layout" | "refresh-client" | "set-window-option" | "setw" | "rename-window"
+        | "rename-session" | "move-window" | "swap-pane" => {
+            log_line(&format!("NOOP: {} (known-accepted no-op)", subcommand));
+            0
+        }
         other => {
-            // Fail-soft: log and exit 0 so CC does not crash on version drift.
+            // Fail-soft: log and exit 0 so CC does not crash on version drift,
+            // but also tell ad-hoc/manual users on stderr that this
+            // subcommand is not implemented (GitHub #1), so they can tell
+            // "not implemented" apart from silent success.
             log_line(&format!("UNHANDLED: subcommand={:?} args={:?}", other, args));
+            eprintln!(
+                "tmux-wezterm-shim: unhandled subcommand '{}' (not implemented - see shim.log)",
+                other
+            );
             0
         }
     }
@@ -1014,4 +1334,107 @@ fn main() {
 
     log_line(&format!("  -> exit {}", exit_code));
     std::process::exit(exit_code);
+}
+
+// ----- tests -----
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translate_key_token_maps_enter_and_c_m() {
+        assert_eq!(translate_key_token("Enter"), "\r");
+        assert_eq!(translate_key_token("C-m"), "\r");
+    }
+
+    #[test]
+    fn translate_key_token_maps_tab_and_space() {
+        assert_eq!(translate_key_token("Tab"), "\t");
+        assert_eq!(translate_key_token("Space"), " ");
+    }
+
+    #[test]
+    fn translate_key_token_maps_control_letter() {
+        assert_eq!(translate_key_token("C-c"), "\u{3}");
+        assert_eq!(translate_key_token("C-a"), "\u{1}");
+    }
+
+    #[test]
+    fn translate_key_token_passes_through_literal_text() {
+        assert_eq!(translate_key_token("hello"), "hello");
+        // Non-letter after "C-" is not a recognized control sequence.
+        assert_eq!(translate_key_token("C-1"), "C-1");
+    }
+
+    #[test]
+    fn build_send_text_literal_mode_joins_with_space() {
+        let tokens = vec!["hello".to_string(), "world".to_string()];
+        assert_eq!(build_send_text(&tokens, true), "hello world");
+    }
+
+    #[test]
+    fn build_send_text_translates_and_concatenates_without_separator() {
+        let tokens = vec!["ls".to_string(), "Enter".to_string()];
+        assert_eq!(build_send_text(&tokens, false), "ls\r");
+    }
+
+    #[test]
+    fn parse_capture_pane_args_parses_all_flags() {
+        let args: Vec<String> = ["-t", "%3", "-p", "-S", "-10", "-E", "-1", "-e"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let opts = parse_capture_pane_args(&args);
+        assert_eq!(opts.target, "%3");
+        assert!(opts.print);
+        assert_eq!(opts.start, Some("-10".to_string()));
+        assert_eq!(opts.end, Some("-1".to_string()));
+        assert!(opts.escapes);
+    }
+
+    #[test]
+    fn parse_capture_pane_args_defaults_when_no_flags_given() {
+        let opts = parse_capture_pane_args(&[]);
+        assert_eq!(opts.target, "");
+        assert!(!opts.print);
+        assert_eq!(opts.start, None);
+        assert_eq!(opts.end, None);
+        assert!(!opts.escapes);
+    }
+
+    #[test]
+    fn doctor_exit_code_zero_when_all_checks_pass() {
+        assert_eq!(doctor_exit_code(&[true, true, true, true]), 0);
+    }
+
+    #[test]
+    fn doctor_exit_code_nonzero_when_any_check_fails() {
+        assert_eq!(doctor_exit_code(&[true, false, true, true]), 1);
+    }
+
+    #[test]
+    fn dump_state_json_pretty_prints_pane_mapping() {
+        let mut state = State::default();
+        state.alloc_pane(42);
+        let json = dump_state_json(&state);
+        assert!(json.contains("tmux_to_wez"));
+        assert!(json.contains("%0"));
+        assert!(json.contains("42"));
+    }
+
+    #[test]
+    fn wezterm_override_from_env_trims_whitespace() {
+        assert_eq!(
+            wezterm_override_from_env(Some("  C:\\custom\\wezterm.exe  ".to_string())),
+            Some("C:\\custom\\wezterm.exe".to_string())
+        );
+    }
+
+    #[test]
+    fn wezterm_override_from_env_rejects_blank_or_missing() {
+        assert_eq!(wezterm_override_from_env(Some("   ".to_string())), None);
+        assert_eq!(wezterm_override_from_env(Some(String::new())), None);
+        assert_eq!(wezterm_override_from_env(None), None);
+    }
 }
