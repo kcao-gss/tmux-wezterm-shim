@@ -1002,6 +1002,82 @@ fn cmd_capture_pane(args: &[String], state: &mut State) -> i32 {
     0
 }
 
+// ----- doctor -----
+
+/// Overall doctor exit code: 0 only if every individual check passed, 1
+/// otherwise, so `tmux doctor` (unlike every other subcommand here) is
+/// scriptable rather than fail-soft.
+fn doctor_exit_code(checks: &[bool]) -> i32 {
+    if checks.iter().all(|c| *c) {
+        0
+    } else {
+        1
+    }
+}
+
+fn doctor_status(ok: bool) -> &'static str {
+    if ok {
+        "OK"
+    } else {
+        "FAIL"
+    }
+}
+
+fn cmd_doctor(_args: &[String], _state: &mut State) -> i32 {
+    // doctor: a scriptable self-diagnostic. Unlike every other subcommand in
+    // this shim, this one is intentionally NOT fail-soft - its whole purpose
+    // is to report real failures with a nonzero exit code so it can be used
+    // in a setup script or CI check.
+    println!("wezterm-tmux-shim doctor");
+
+    let wezterm_path = wezterm_bin();
+    let (_, _, version_exit) = run_wezterm(&["--version"]);
+    let wezterm_ok = version_exit == 0;
+    println!(
+        "  wezterm binary: {} [{}]",
+        wezterm_path,
+        doctor_status(wezterm_ok)
+    );
+
+    let state_file = state_path();
+    let dir = state_dir();
+    let _ = fs::create_dir_all(&dir);
+    let probe = dir.join(".doctor_probe");
+    let state_ok = fs::write(&probe, b"probe").is_ok();
+    let _ = fs::remove_file(&probe);
+    println!(
+        "  state file: {} [{}]",
+        state_file.display(),
+        doctor_status(state_ok)
+    );
+
+    let (pane_stdout, _, pane_exit) = run_wezterm(&["cli", "list", "--format", "json"]);
+    let panes_ok = pane_exit == 0;
+    let pane_count = serde_json::from_str::<Vec<WezPane>>(&pane_stdout)
+        .map(|p| p.len())
+        .unwrap_or(0);
+    println!(
+        "  pane count: {} [{}]",
+        pane_count,
+        doctor_status(panes_ok)
+    );
+
+    let bash_found = bash_bin();
+    let bash_ok = bash_found.is_some();
+    println!(
+        "  bash.exe: {} [{}]",
+        bash_found.unwrap_or_else(|| "not found".to_string()),
+        doctor_status(bash_ok)
+    );
+
+    let exit_code = doctor_exit_code(&[wezterm_ok, state_ok, panes_ok, bash_ok]);
+    println!(
+        "Overall: {}",
+        if exit_code == 0 { "PASS" } else { "FAIL" }
+    );
+    exit_code
+}
+
 fn cmd_set_environment(args: &[String], state: &mut State) -> i32 {
     // set-environment -g <NAME> <VALUE>
     // Also: set -as <...> accepted as no-op-ok.
@@ -1157,6 +1233,7 @@ fn dispatch(subcommand: &str, args: &[String], state: &mut State) -> i32 {
         "kill-window" => cmd_kill_window(args, state),
         "send-keys" => cmd_send_keys(args, state),
         "capture-pane" => cmd_capture_pane(args, state),
+        "doctor" => cmd_doctor(args, state),
         // kill-session intentionally stays on the UNHANDLED no-op path below:
         // it would otherwise mean mass-killing every pane the shim knows
         // about, which could tear down unrelated WezTerm panes/windows the
@@ -1290,5 +1367,15 @@ mod tests {
         assert_eq!(opts.start, None);
         assert_eq!(opts.end, None);
         assert!(!opts.escapes);
+    }
+
+    #[test]
+    fn doctor_exit_code_zero_when_all_checks_pass() {
+        assert_eq!(doctor_exit_code(&[true, true, true, true]), 0);
+    }
+
+    #[test]
+    fn doctor_exit_code_nonzero_when_any_check_fails() {
+        assert_eq!(doctor_exit_code(&[true, false, true, true]), 1);
     }
 }
