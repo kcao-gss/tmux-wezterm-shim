@@ -813,6 +813,98 @@ fn cmd_respawn_pane(args: &[String], state: &mut State) -> i32 {
     ]);
     0
 }
+// ----- send-keys key translation -----
+
+/// Translate a single non-literal send-keys token into the string that
+/// should actually be sent to the pane. tmux key names we recognize are
+/// mapped to their control sequence; anything else (including symbolic key
+/// names we do not know about) is passed through as literal text, matching
+/// tmux's own fallback of treating an unrecognized token as literal input.
+fn translate_key_token(token: &str) -> String {
+    match token {
+        "Enter" | "C-m" => "\r".to_string(),
+        "Tab" => "\t".to_string(),
+        "Space" => " ".to_string(),
+        _ => {
+            if let Some(rest) = token.strip_prefix("C-") {
+                let mut chars = rest.chars();
+                if let (Some(c), None) = (chars.next(), chars.next()) {
+                    if c.is_ascii_alphabetic() {
+                        let ctrl = c.to_ascii_uppercase() as u8 - b'A' + 1;
+                        return (ctrl as char).to_string();
+                    }
+                }
+            }
+            token.to_string()
+        }
+    }
+}
+
+/// Build the text to hand to `wezterm cli send-text` for a send-keys
+/// invocation. In literal mode (-l) tokens are simply space-joined and sent
+/// verbatim - tmux's -l treats all remaining arguments as a single literal
+/// string. Otherwise each token is translated individually (recognized key
+/// name -> control sequence, else literal text) and concatenated with no
+/// separator, since tmux never inserts implied whitespace between separate
+/// key/text arguments.
+fn build_send_text(tokens: &[String], literal: bool) -> String {
+    if literal {
+        tokens.join(" ")
+    } else {
+        tokens.iter().map(|t| translate_key_token(t.as_str())).collect()
+    }
+}
+
+fn cmd_send_keys(args: &[String], state: &mut State) -> i32 {
+    // send-keys [-l] -t <target> <key/text> [<key/text> ...]
+    let mut target = String::new();
+    let mut literal = false;
+    let mut tokens: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                i += 1;
+                if i < args.len() {
+                    target = args[i].clone();
+                }
+            }
+            "-l" => literal = true,
+            _ => tokens.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    // resolve_current_pane already prefers WEZTERM_PANE (see its own doc
+    // comment), so no separate WEZTERM_PANE check is needed here.
+    let target = if target.is_empty() {
+        resolve_current_pane(state)
+    } else {
+        target
+    };
+    let wez_target = match resolve_target(&target, state) {
+        Some(id) => id,
+        None => {
+            log_line(&format!("  send-keys: could not resolve target={}", target));
+            return 0;
+        }
+    };
+    let text = build_send_text(&tokens, literal);
+    let pane_id_str = wez_target.to_string();
+    log_line(&format!(
+        "  send-keys: target={} wez_target={} literal={} text={:?}",
+        target, wez_target, literal, text
+    ));
+    run_wezterm(&[
+        "cli",
+        "send-text",
+        "--pane-id",
+        pane_id_str.as_str(),
+        "--no-paste",
+        text.as_str(),
+    ]);
+    0
+}
+
 fn cmd_set_environment(args: &[String], state: &mut State) -> i32 {
     // set-environment -g <NAME> <VALUE>
     // Also: set -as <...> accepted as no-op-ok.
@@ -966,6 +1058,7 @@ fn dispatch(subcommand: &str, args: &[String], state: &mut State) -> i32 {
         "break-pane" => cmd_break_pane(args, state),
         "kill-pane" => cmd_kill_pane(args, state),
         "kill-window" => cmd_kill_window(args, state),
+        "send-keys" => cmd_send_keys(args, state),
         // kill-session intentionally stays on the UNHANDLED no-op path below:
         // it would otherwise mean mass-killing every pane the shim knows
         // about, which could tear down unrelated WezTerm panes/windows the
@@ -1032,4 +1125,48 @@ fn main() {
 
     log_line(&format!("  -> exit {}", exit_code));
     std::process::exit(exit_code);
+}
+
+// ----- tests -----
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translate_key_token_maps_enter_and_c_m() {
+        assert_eq!(translate_key_token("Enter"), "\r");
+        assert_eq!(translate_key_token("C-m"), "\r");
+    }
+
+    #[test]
+    fn translate_key_token_maps_tab_and_space() {
+        assert_eq!(translate_key_token("Tab"), "\t");
+        assert_eq!(translate_key_token("Space"), " ");
+    }
+
+    #[test]
+    fn translate_key_token_maps_control_letter() {
+        assert_eq!(translate_key_token("C-c"), "\u{3}");
+        assert_eq!(translate_key_token("C-a"), "\u{1}");
+    }
+
+    #[test]
+    fn translate_key_token_passes_through_literal_text() {
+        assert_eq!(translate_key_token("hello"), "hello");
+        // Non-letter after "C-" is not a recognized control sequence.
+        assert_eq!(translate_key_token("C-1"), "C-1");
+    }
+
+    #[test]
+    fn build_send_text_literal_mode_joins_with_space() {
+        let tokens = vec!["hello".to_string(), "world".to_string()];
+        assert_eq!(build_send_text(&tokens, true), "hello world");
+    }
+
+    #[test]
+    fn build_send_text_translates_and_concatenates_without_separator() {
+        let tokens = vec!["ls".to_string(), "Enter".to_string()];
+        assert_eq!(build_send_text(&tokens, false), "ls\r");
+    }
 }
