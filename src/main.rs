@@ -905,6 +905,103 @@ fn cmd_send_keys(args: &[String], state: &mut State) -> i32 {
     0
 }
 
+// ----- capture-pane -----
+
+/// Parsed capture-pane flags. `start`/`end` are kept as the raw string tmux
+/// gave us (they can be negative, meaning "into the scrollback") since
+/// `wezterm cli get-text --start-line/--end-line` accepts the same signed
+/// line-number convention directly - no reinterpretation needed.
+struct CapturePaneOpts {
+    target: String,
+    print: bool,
+    start: Option<String>,
+    end: Option<String>,
+    escapes: bool,
+}
+
+fn parse_capture_pane_args(args: &[String]) -> CapturePaneOpts {
+    let mut opts = CapturePaneOpts {
+        target: String::new(),
+        print: false,
+        start: None,
+        end: None,
+        escapes: false,
+    };
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                i += 1;
+                if i < args.len() {
+                    opts.target = args[i].clone();
+                }
+            }
+            "-p" => opts.print = true,
+            "-e" => opts.escapes = true,
+            "-S" => {
+                i += 1;
+                if i < args.len() {
+                    opts.start = Some(args[i].clone());
+                }
+            }
+            "-E" => {
+                i += 1;
+                if i < args.len() {
+                    opts.end = Some(args[i].clone());
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    opts
+}
+
+fn cmd_capture_pane(args: &[String], state: &mut State) -> i32 {
+    // capture-pane -t <target> [-p] [-S <start>] [-E <end>] [-e]
+    //
+    // Maps directly onto `wezterm cli get-text`, which (unlike a fallback
+    // full-text-then-slice approach) supports --start-line/--end-line with
+    // the same signed line-number convention tmux uses (0 = top of screen,
+    // negative = into scrollback). -p is effectively the only supported
+    // mode here - there is no tmux paste-buffer equivalent in WezTerm, so
+    // capturing without -p is a fail-soft no-op (nothing to do with the
+    // text otherwise).
+    let opts = parse_capture_pane_args(args);
+    let target = if opts.target.is_empty() {
+        resolve_current_pane(state)
+    } else {
+        opts.target
+    };
+    let wez_target = match resolve_target(&target, state) {
+        Some(id) => id,
+        None => {
+            log_line(&format!("  capture-pane: could not resolve target={}", target));
+            return 0;
+        }
+    };
+    let pane_id_str = wez_target.to_string();
+    let mut wez_args = vec!["cli", "get-text", "--pane-id", pane_id_str.as_str()];
+    if let Some(s) = opts.start.as_deref() {
+        wez_args.push("--start-line");
+        wez_args.push(s);
+    }
+    if let Some(e) = opts.end.as_deref() {
+        wez_args.push("--end-line");
+        wez_args.push(e);
+    }
+    if opts.escapes {
+        wez_args.push("--escapes");
+    }
+    let (stdout, _, _) = run_wezterm(&wez_args);
+    if opts.print {
+        print!("{}", stdout);
+    } else {
+        log_line("  capture-pane: -p not set; nothing to output (no tmux paste-buffer equivalent)");
+    }
+    0
+}
+
 fn cmd_set_environment(args: &[String], state: &mut State) -> i32 {
     // set-environment -g <NAME> <VALUE>
     // Also: set -as <...> accepted as no-op-ok.
@@ -1059,6 +1156,7 @@ fn dispatch(subcommand: &str, args: &[String], state: &mut State) -> i32 {
         "kill-pane" => cmd_kill_pane(args, state),
         "kill-window" => cmd_kill_window(args, state),
         "send-keys" => cmd_send_keys(args, state),
+        "capture-pane" => cmd_capture_pane(args, state),
         // kill-session intentionally stays on the UNHANDLED no-op path below:
         // it would otherwise mean mass-killing every pane the shim knows
         // about, which could tear down unrelated WezTerm panes/windows the
@@ -1168,5 +1266,29 @@ mod tests {
     fn build_send_text_translates_and_concatenates_without_separator() {
         let tokens = vec!["ls".to_string(), "Enter".to_string()];
         assert_eq!(build_send_text(&tokens, false), "ls\r");
+    }
+
+    #[test]
+    fn parse_capture_pane_args_parses_all_flags() {
+        let args: Vec<String> = ["-t", "%3", "-p", "-S", "-10", "-E", "-1", "-e"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let opts = parse_capture_pane_args(&args);
+        assert_eq!(opts.target, "%3");
+        assert!(opts.print);
+        assert_eq!(opts.start, Some("-10".to_string()));
+        assert_eq!(opts.end, Some("-1".to_string()));
+        assert!(opts.escapes);
+    }
+
+    #[test]
+    fn parse_capture_pane_args_defaults_when_no_flags_given() {
+        let opts = parse_capture_pane_args(&[]);
+        assert_eq!(opts.target, "");
+        assert!(!opts.print);
+        assert_eq!(opts.start, None);
+        assert_eq!(opts.end, None);
+        assert!(!opts.escapes);
     }
 }
