@@ -60,26 +60,6 @@ impl State {
         self.tmux_to_wez.get(tmux_id).copied()
     }
 
-    /// Force tmux_id to map to wez_id, overriding any stale mapping on either
-    /// side. Used to anchor WEZTERM_PANE as the authoritative "current pane":
-    /// if tmux_id was previously bound to a different wezterm pane, or wez_id
-    /// was previously known under a different tmux id, both stale entries are
-    /// removed before the new pair is inserted.
-    fn bind_pane(&mut self, tmux_id: &str, wez_id: u64) {
-        if let Some(old_wez) = self.tmux_to_wez.get(tmux_id).copied() {
-            if old_wez != wez_id {
-                self.wez_to_tmux.remove(&old_wez);
-            }
-        }
-        if let Some(old_tid) = self.wez_to_tmux.get(&wez_id).cloned() {
-            if old_tid != tmux_id {
-                self.tmux_to_wez.remove(&old_tid);
-            }
-        }
-        self.tmux_to_wez.insert(tmux_id.to_string(), wez_id);
-        self.wez_to_tmux.insert(wez_id, tmux_id.to_string());
-    }
-
     /// Remove all bookkeeping for a WezTerm pane: its tmux id mapping (both
     /// directions) and any remain-on-exit policy. Used when a pane is
     /// actually destroyed (kill-pane/kill-window) so stale ids do not
@@ -323,23 +303,31 @@ fn apply_format(fmt: &str, pane_id: Option<&str>, window_id: Option<&str>) -> St
 }
 
 /// Resolve the "current" pane tmux id from environment. WEZTERM_PANE is
-/// authoritative when present; TMUX_PANE is rebound to it if the two disagree.
-/// Allocates a new id if unseen.
+/// authoritative when present; its globally-unique tmux id is looked up (or
+/// allocated) regardless of what TMUX_PANE says. Allocates a new id if unseen.
 fn resolve_current_pane(state: &mut State) -> String {
     // WEZTERM_PANE is authoritative: it is the actual pane wezterm launched
-    // this process in, so it always names the real "current" pane. CC also
-    // reconstructs TMUX_PANE from a previous display-message reply, which can
-    // go stale (e.g. still pointing at an old session's pane after a restart).
-    // When both are present, force the tmux id CC already knows as TMUX_PANE
-    // to point at the real WEZTERM_PANE rather than trusting a stale binding.
+    // this process in, so it always names the real "current" pane. state.json
+    // is ONE GLOBAL table shared by every concurrent CC session - there is no
+    // per-session or per-socket isolation (the tmux -S <socket> argument is
+    // parsed and discarded, see main()). CC's own install instructions set
+    // TMUX_PANE to the same literal default ("%0") for every new session, so
+    // unrelated concurrent sessions legitimately share that token, and child
+    // processes keep inheriting it unchanged for the session's lifetime.
+    //
+    // This used to force-rebind TMUX_PANE's value to WEZTERM_PANE (to recover
+    // from CC recalling a stale TMUX_PANE after its own restart). That
+    // rebinding could not distinguish "this token is my own stale self
+    // reference" from "this token is another still-active session's
+    // legitimate binding" - so whichever session called us most recently
+    // (typically whatever tab is actively being used) kept stealing shared
+    // tokens like "%0" away from whoever really owned them, silently
+    // redirecting that session's split-window/kill-window calls into the
+    // thief's tab. Deriving the id purely from WEZTERM_PANE (globally unique
+    // per real pane) instead means each real pane keeps exactly one tmux id
+    // for its lifetime and never overwrites another pane's mapping.
     if let Ok(wp) = std::env::var("WEZTERM_PANE") {
         if let Ok(wid) = wp.parse::<u64>() {
-            if let Ok(tp) = std::env::var("TMUX_PANE") {
-                if !tp.is_empty() {
-                    state.bind_pane(&tp, wid);
-                    return tp;
-                }
-            }
             return state.tmux_id_for_wez(wid);
         }
     }
@@ -1445,6 +1433,47 @@ mod tests {
         assert!(json.contains("tmux_to_wez"));
         assert!(json.contains("%0"));
         assert!(json.contains("42"));
+    }
+
+    #[test]
+    fn tmux_id_for_wez_does_not_let_a_second_pane_steal_an_existing_id() {
+        // Reproduces the live cross-session hijack: two unrelated real
+        // wezterm panes (two different CC sessions) both present the shared
+        // bootstrap TMUX_PANE="%0" alongside their own distinct WEZTERM_PANE.
+        // Session A's real pane must keep "%0" - allocating session B's real
+        // pane must NOT overwrite A's existing entry.
+        let mut state = State::default();
+        let session_a_id = state.tmux_id_for_wez(64); // session A's real pane
+        let session_b_id = state.tmux_id_for_wez(66); // session B's real pane
+        assert_ne!(session_a_id, session_b_id);
+        // Both must keep resolving to their own real pane, not each other's.
+        assert_eq!(state.wez_id_for_tmux(&session_a_id), Some(64));
+        assert_eq!(state.wez_id_for_tmux(&session_b_id), Some(66));
+    }
+
+    #[test]
+    fn resolve_current_pane_ignores_a_shared_tmux_pane_bootstrap_value() {
+        // install.ps1 tells every new session to bootstrap with the same
+        // literal TMUX_PANE="%0". Two unrelated sessions (two real wezterm
+        // panes) both present that identical value alongside their own
+        // distinct WEZTERM_PANE. Session A must not have its "%0" binding
+        // stolen when session B later calls in with the same TMUX_PANE.
+        std::env::set_var("TMUX_PANE", "%0");
+        let mut state = State::default();
+
+        std::env::set_var("WEZTERM_PANE", "64");
+        let session_a_id = resolve_current_pane(&mut state);
+
+        std::env::set_var("WEZTERM_PANE", "66");
+        let session_b_id = resolve_current_pane(&mut state);
+
+        std::env::remove_var("WEZTERM_PANE");
+        std::env::remove_var("TMUX_PANE");
+
+        assert_ne!(session_a_id, session_b_id);
+        // Session A's id must still resolve to session A's real pane, not
+        // have been hijacked to point at session B's.
+        assert_eq!(state.wez_id_for_tmux(&session_a_id), Some(64));
     }
 
     #[test]
