@@ -279,14 +279,29 @@ fn bash_bin() -> Option<String> {
 #[derive(Debug, Deserialize)]
 struct WezPane {
     pane_id: u64,
-    window_id: u64,
-    #[allow(dead_code)]
     tab_id: u64,
 }
 
 fn list_wez_panes() -> Vec<WezPane> {
     let (stdout, _, _) = run_wezterm(&["cli", "list", "--format", "json"]);
     serde_json::from_str(&stdout).unwrap_or_default()
+}
+
+/// Find the "tmux window" a given wezterm pane actually lives in.
+///
+/// This intentionally reads wezterm's `tab_id`, not its `window_id`. WezTerm's
+/// `window_id` names the OS-level window, which in the common setup (one
+/// WezTerm window, many tabs - confirmed live: 7 tabs all reporting
+/// window_id=0) never varies, so every tmux "window" the shim reported was
+/// actually the entire wezterm instance. `tab_id` is what actually separates
+/// one CC session's panes from another's, so it - not window_id - is the
+/// correct source for tmux's window concept.
+///
+/// Must also be used instead of `panes.first()` for reporting a newly created
+/// pane's window - the first pane in `wezterm cli list` is whichever tab
+/// sorts first, not necessarily the tab the pane in question belongs to.
+fn window_id_for_pane(panes: &[WezPane], pane_id: u64) -> Option<u64> {
+    panes.iter().find(|p| p.pane_id == pane_id).map(|p| p.tab_id)
 }
 
 // ----- format token substitution -----
@@ -357,8 +372,8 @@ fn resolve_target(target: &str, state: &mut State) -> Option<u64> {
     let panes = list_wez_panes();
     let cur_tmux = resolve_current_pane(state);
     if let Some(cur_wez) = state.wez_id_for_tmux(&cur_tmux) {
-        if let Some(cur_window) = panes.iter().find(|p| p.pane_id == cur_wez).map(|p| p.window_id) {
-            if let Some(p) = panes.iter().find(|p| p.window_id == cur_window) {
+        if let Some(cur_window) = window_id_for_pane(&panes, cur_wez) {
+            if let Some(p) = panes.iter().find(|p| p.tab_id == cur_window) {
                 return Some(p.pane_id);
             }
         }
@@ -397,7 +412,7 @@ fn cmd_new_session(args: &[String], state: &mut State) -> i32 {
         let tmux_id = state.alloc_pane(wez_id);
         let window_id = panes
             .first()
-            .map(|p| format!("@{}", p.window_id))
+            .map(|p| format!("@{}", p.tab_id))
             .unwrap_or_else(|| "@0".into());
         let resolved = apply_format(&fmt, Some(&tmux_id), Some(&window_id));
         println!("{}", resolved);
@@ -431,7 +446,7 @@ fn cmd_new_window(args: &[String], state: &mut State) -> i32 {
         let tmux_id = state.alloc_pane(wez_id);
         let window_id = panes
             .first()
-            .map(|p| format!("@{}", p.window_id))
+            .map(|p| format!("@{}", p.tab_id))
             .unwrap_or_else(|| "@0".into());
         let resolved = apply_format(&fmt, Some(&tmux_id), Some(&window_id));
         println!("{}", resolved);
@@ -498,9 +513,14 @@ fn cmd_split_window(args: &[String], state: &mut State) -> i32 {
     };
     if print_pane {
         let panes = list_wez_panes();
-        let window_id = panes
-            .first()
-            .map(|p| format!("@{}", p.window_id))
+        // Report the window the *new* pane actually landed in, not whichever
+        // window sorts first in `wezterm cli list` - see window_id_for_pane.
+        // Fall back to the split target's window if the new pane id was
+        // unparseable (synthetic-id path above).
+        let window_pane_id = new_wez_id.unwrap_or(wez_target);
+        let window_id = window_id_for_pane(&panes, window_pane_id)
+            .or_else(|| panes.first().map(|p| p.tab_id))
+            .map(|w| format!("@{}", w))
             .unwrap_or_else(|| "@0".into());
         let resolved = apply_format(&fmt, Some(&tmux_id), Some(&window_id));
         println!("{}", resolved);
@@ -545,12 +565,12 @@ fn cmd_list_panes(args: &[String], state: &mut State) -> i32 {
     let cur_wez = state.wez_id_for_tmux(&cur_tmux);
     for wp in &panes {
         if let Some(wid) = window_filter {
-            if wp.window_id != wid {
+            if wp.tab_id != wid {
                 continue;
             }
         }
         let tmux_id = state.tmux_id_for_wez(wp.pane_id);
-        let window_id = format!("@{}", wp.window_id);
+        let window_id = format!("@{}", wp.tab_id);
         let mut line = apply_format(&fmt, Some(&tmux_id), Some(&window_id));
         // Mark the pane bound to WEZTERM_PANE as active/current so CC treats
         // it (not an arbitrary first pane) as its own when scanning this list.
@@ -598,9 +618,9 @@ fn cmd_display_message(args: &[String], state: &mut State) -> i32 {
         let panes = list_wez_panes();
         let cur_wez = state.wez_id_for_tmux(&cur_pane);
         let window_id = cur_wez
-            .and_then(|wid| panes.iter().find(|p| p.pane_id == wid))
-            .or_else(|| panes.first())
-            .map(|p| format!("@{}", p.window_id))
+            .and_then(|wid| window_id_for_pane(&panes, wid))
+            .or_else(|| panes.first().map(|p| p.tab_id))
+            .map(|w| format!("@{}", w))
             .unwrap_or_else(|| "@0".into());
         let resolved = apply_format(&fmt, Some(&cur_pane), Some(&window_id));
         println!("{}", resolved);
@@ -1215,9 +1235,7 @@ fn cmd_kill_window(args: &[String], state: &mut State) -> i32 {
         } else {
             target.clone()
         };
-        resolve_target(&pane_target, state).and_then(|wid| {
-            panes.iter().find(|p| p.pane_id == wid).map(|p| p.window_id)
-        })
+        resolve_target(&pane_target, state).and_then(|wid| window_id_for_pane(&panes, wid))
     };
     let window_id = match window_id {
         Some(w) => w,
@@ -1227,7 +1245,11 @@ fn cmd_kill_window(args: &[String], state: &mut State) -> i32 {
         }
     };
     log_line(&format!("  kill-window: window_id={}", window_id));
-    for p in panes.iter().filter(|p| p.window_id == window_id) {
+    // Filter by tab_id, not wezterm's OS-level window_id: in the common setup
+    // (one WezTerm window, many tabs) window_id is constant across every tab,
+    // so filtering on it here would kill every pane in the whole instance -
+    // see window_id_for_pane's doc comment for the full story.
+    for p in panes.iter().filter(|p| p.tab_id == window_id) {
         let pane_id_str = p.pane_id.to_string();
         let (_, _, exit) = run_wezterm(&["cli", "kill-pane", "--pane-id", pane_id_str.as_str()]);
         log_line(&format!(
@@ -1438,5 +1460,37 @@ mod tests {
         assert_eq!(wezterm_override_from_env(Some("   ".to_string())), None);
         assert_eq!(wezterm_override_from_env(Some(String::new())), None);
         assert_eq!(wezterm_override_from_env(None), None);
+    }
+
+    #[test]
+    fn window_id_for_pane_finds_the_pane_actual_tab_not_the_first_one() {
+        let panes = vec![
+            WezPane { pane_id: 1, tab_id: 0 },
+            WezPane { pane_id: 2, tab_id: 1 },
+        ];
+        // Pane 2 lives in tab 1, even though tab 0's pane sorts first.
+        assert_eq!(window_id_for_pane(&panes, 2), Some(1));
+    }
+
+    #[test]
+    fn window_id_for_pane_none_when_pane_not_found() {
+        let panes = vec![WezPane { pane_id: 1, tab_id: 0 }];
+        assert_eq!(window_id_for_pane(&panes, 99), None);
+    }
+
+    #[test]
+    fn window_id_for_pane_distinguishes_tabs_sharing_one_os_window() {
+        // Real-world wezterm layout: one OS window hosting many tabs, so
+        // every pane's window_id is identical - only tab_id tells them
+        // apart. This reproduces the live bug where every "window-scoped"
+        // tmux op (list-panes, kill-window, split-window) matched every
+        // pane in the whole instance because it filtered on window_id.
+        let panes = vec![
+            WezPane { pane_id: 10, tab_id: 5 },
+            WezPane { pane_id: 11, tab_id: 5 },
+            WezPane { pane_id: 20, tab_id: 9 },
+        ];
+        assert_eq!(window_id_for_pane(&panes, 20), Some(9));
+        assert_ne!(window_id_for_pane(&panes, 20), window_id_for_pane(&panes, 10));
     }
 }
